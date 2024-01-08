@@ -1,0 +1,45 @@
+{
+   "name": "pg_savior",
+   "abstract": "Prevent accidental data loss",
+   "description": "A PostgreSQL extension designed to prevent accidental data loss due to non-parameterized DELETE queries without a WHERE clause.",
+   "version": "1.0.0",
+   "maintainer": [
+      "viggy28 <villan.lampard.epl@gmail.com>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_savior": {
+         "abstract": "Prevent accidental data loss",
+         "file": "pg_savior--1.0.0.sql",
+         "docfile": "README.md",
+         "version": "1.0.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "10.0.0"
+         }
+      }
+   },
+   "resources": {
+      "bugtracker": {
+         "web": "https://github.com/viggy28/pg_savior/issues"
+      },
+      "repository": {
+         "url": "git://github.com/viggy28/pg_savior.git",
+         "web": "https://github.com/viggy28/pg_savior",
+         "type": "git"
+      }
+   },
+   "generated_by": "David E. Wheeler",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "delete",
+      "data loss",
+      "safe"
+   ]
+}
