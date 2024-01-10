@@ -46,8 +46,6 @@ id
 (1 row)
 ```
 
-![demo.png](demo.png)
-
 ## Usage
 
 After installing the extension, you can enable it in your PostgreSQL database with the following command:
