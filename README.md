@@ -2,11 +2,17 @@
 
 pg_savior is a PostgreSQL extension designed to prevent accidental data loss due to non-parameterized DELETE queries without a WHERE clause.
 
+## Warning
+
+This is not ready for production yet. It's a WIP.
+
 ## Features
 
-- Detects DELETE queries without a WHERE clause.
-- Logs detailed information about detected queries.
-- Hooks into the PostgreSQL query execution process.
+- Detects DELETE queries without a WHERE clause
+- Detects DELETE queries which uses index scan
+- Detects DELETE queries which uses CTE & subqueries
+- Logs detailed information about detected queries
+- Hooks into the PostgreSQL query execution process
 
 ## Installation
 
@@ -14,10 +20,6 @@ pg_savior is a PostgreSQL extension designed to prevent accidental data loss due
 2. Navigate to the repository directory.
 3. Run `make` to build the extension.
 4. Run `make install` to install the extension.
-
-## Warning
-
-This is not ready for production yet. It's a WIP and there cases where it blocks delete statements even if there is a "where" condition.
 
 ## Demo
 

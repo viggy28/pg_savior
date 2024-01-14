@@ -45,28 +45,58 @@ bool walkPlanTree(Plan *plan);
 
 // walk the plan tree to find if there is a WHERE clause
 bool walkPlanTree(Plan *plan) {
+  elog(INFO, "pg_savior: walkPlanTree called");
+  bool hasWhereClause = false;
+  elog(INFO, "has_where_clause: %d", hasWhereClause);
   if (plan == NULL) {
     elog(INFO, "pg_savior: planTree is NULL");
     return false;
   }
   elog(INFO, "pg_savior: nodeType: %d", plan->type);
-  static bool hasWhereClause = false;
   if (plan->qual != NULL) {
-    ListCell *cell;
-    foreach (cell, plan->qual) {
-      Node *node = lfirst(cell);
-      // We are just checking operation expression
-      if (node->type == T_OpExpr) {
-        hasWhereClause = true;
-        elog(INFO, "pg_savior: WHERE clause found");
+    if (plan->qual->type == T_List) {
+      ListCell *cell;
+      foreach (cell, plan->qual) {
+        Node *node = lfirst(cell);
+        // We are just checking operation expression
+        if (node->type == T_OpExpr) {
+          return true;
+          elog(INFO, "pg_savior: WHERE clause found");
+        }
       }
     }
   }
+  // subquery and CTE's creates hash join
+  if (plan->type == T_HashJoin) {
+    elog(INFO, "pg_savior: HashJoin found");
+    HashJoin *hashJoin = (HashJoin *)plan;
+    if (hashJoin->hashclauses != NULL) {
+      elog(INFO, "pg_savior: hashclauses found");
+      return true;
+    }
+  }
+
+  // queries which uses index scan
+  if (plan->type == T_IndexScan) {
+    elog(INFO, "pg_savior: IndexScan found");
+    IndexScan *indexScan = (IndexScan *)plan;
+    if (indexScan->indexqual != NULL) {
+      elog(INFO, "pg_savior: operation expression found");
+      return true;
+    }
+  }
+
   if (plan->lefttree != NULL) {
     hasWhereClause = walkPlanTree(plan->lefttree);
+    if (hasWhereClause) {
+      return true;
+    }
   }
   if (plan->righttree != NULL) {
     hasWhereClause = walkPlanTree(plan->righttree);
+    if (hasWhereClause) {
+      return true;
+    }
   }
   return hasWhereClause;
 }
