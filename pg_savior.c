@@ -5,17 +5,20 @@
 #include "executor/spi.h"
 #include "executor/tstoreReceiver.h"
 #include "funcapi.h"
+#include "nodes/nodes.h"
 #include "utils/builtins.h"
-
 #include <miscadmin.h>
 static ExecutorStart_hook_type ExecutorStart_old_hook = NULL;
 static ExecutorRun_hook_type ExecutorRun_old_hook = NULL;
 
 static void ExecutorStart_hook_savior(QueryDesc *queryDesc, int eflags) {
+  elog(INFO, "pg_savior: ExecutorStart_hook called");
   if (ExecutorStart_old_hook)
     ExecutorStart_old_hook(queryDesc, eflags);
   else
-    standard_ExecutorStart(queryDesc, eflags);
+    elog(INFO, "pg_savior: ExecutorStart called");
+  elog(INFO, "pg_savior: queryDesc->sourceText: %s", queryDesc->sourceText);
+  standard_ExecutorStart(queryDesc, eflags);
 }
 
 // insert the query into the saved_queries table
@@ -38,9 +41,40 @@ static void insert_meta(QueryDesc *qd) {
   SPI_finish();
 }
 
+bool walkPlanTree(Plan *plan);
+
+// walk the plan tree to find if there is a WHERE clause
+bool walkPlanTree(Plan *plan) {
+  if (plan == NULL) {
+    elog(INFO, "pg_savior: planTree is NULL");
+    return false;
+  }
+  elog(INFO, "pg_savior: nodeType: %d", plan->type);
+  static bool hasWhereClause = false;
+  if (plan->qual != NULL) {
+    ListCell *cell;
+    foreach (cell, plan->qual) {
+      Node *node = lfirst(cell);
+      // We are just checking operation expression
+      if (node->type == T_OpExpr) {
+        hasWhereClause = true;
+        elog(INFO, "pg_savior: WHERE clause found");
+      }
+    }
+  }
+  if (plan->lefttree != NULL) {
+    hasWhereClause = walkPlanTree(plan->lefttree);
+  }
+  if (plan->righttree != NULL) {
+    hasWhereClause = walkPlanTree(plan->righttree);
+  }
+  return hasWhereClause;
+}
+
 static void ExecutorRun_hook_savior(QueryDesc *queryDesc,
                                     ScanDirection direction, uint64 count,
                                     bool execute_once) {
+  Plan *plan = queryDesc->plannedstmt->planTree;
   if (ExecutorRun_old_hook)
     ExecutorRun_old_hook(queryDesc, direction, count, execute_once);
   else
@@ -49,19 +83,9 @@ static void ExecutorRun_hook_savior(QueryDesc *queryDesc,
       elog(INFO, "pg_savior: DELETE statement detected");
       if (queryDesc->params == NULL) {
         // non parameterized DELETE statement detected
-        char *queryCopy = strdup(queryDesc->sourceText);
-        char *token = strtok(queryCopy, " ");
-        bool whereFound = false;
-        while (token != NULL) {
-          if (strcmp(token, "where") == 0) {
-            // Found "where" as a separate word
-            // it's fragile, but it's the best we can do
-            whereFound = true;
-            break;
-          }
-          token = strtok(NULL, " ");
-        }
-        if (whereFound) {
+        char *s = nodeToString(plan);
+        elog(INFO, "pg_savior: planTree: %s", s);
+        if (walkPlanTree(plan)) {
           // WHERE clause found in non parameterized "DELETE" statement
           standard_ExecutorRun(queryDesc, direction, count, execute_once);
         } else {
@@ -84,6 +108,7 @@ static void ExecutorRun_hook_savior(QueryDesc *queryDesc,
 void _PG_init(void);
 
 void _PG_init() {
+  elog(INFO, "pg_savior: _PG_init called");
   ExecutorStart_old_hook = ExecutorStart_hook;
   ExecutorStart_hook = ExecutorStart_hook_savior;
   ExecutorRun_old_hook = ExecutorRun_hook;

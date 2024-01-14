@@ -15,6 +15,10 @@ pg_savior is a PostgreSQL extension designed to prevent accidental data loss due
 3. Run `make` to build the extension.
 4. Run `make install` to install the extension.
 
+## Warning
+
+This is not ready for production yet. It's a WIP and there cases where it blocks delete statements even if there is a "where" condition.
+
 ## Demo
 
 ```
