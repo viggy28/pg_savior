@@ -1,0 +1,25 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+instance:
+  init:
+    - create extension pg_savior
+    - create table emp
+      (
+      id int
+      )
+tests:
+  - name: "RD0001: pg_savior: Check if pg_savior is installed"
+    query: "select count(*) from pg_extension where extname = 'pg_savior'"
+    expected: "1"
+
+  - name: "RD0001: pg_savior: delete without where clause"
+    steps:
+      - query: "insert into emp values (1)"
+      - query: "insert into emp values (2)"
+      - query: "insert into emp values (3)"
+      - query: "select count(*) from emp as count"
+        results:
+          - count: 3
+      - query: "delete from emp"
+      - query: "select count(*) from emp as count"
+        results:
+          - count: 3
