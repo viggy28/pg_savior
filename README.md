@@ -16,7 +16,9 @@ This is not ready for production yet. It's a WIP.
 
 ## Installation
 
-1. Clone the repository.
+Source:
+
+1. Clone the repository or [download from PGXN](https://pgxn.org/extension/pg_savior)
 2. Navigate to the repository directory.
 3. Run `make` to build the extension.
 4. Run `make install` to install the extension.
