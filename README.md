@@ -19,7 +19,7 @@ This is not ready for production yet. It's a WIP.
 1. Clone the repository.
 2. Navigate to the repository directory.
 3. Run `make` to build the extension.
-4. Run `make install` to install the extension.
+4. Run `sudo make install` to install the extension.
 
 ## Demo
 

@@ -3,3 +3,5 @@
 *.dylib
 regression.diffs
 regression.out
+.idea/
+.vscode/
