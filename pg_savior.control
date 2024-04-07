@@ -1,4 +1,4 @@
 comment = 'Postgres extension to save OOPS mistakes'
-default_version = '1.0.0'
+default_version = '0.0.1'
 relocatable = true
 module_pathname = '$libdir/pg_savior'
