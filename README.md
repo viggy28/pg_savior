@@ -13,12 +13,17 @@ The extension is currently under active development. This project is not ready f
 - [ ] Prevent CREATE INDEX without concurrently
 - [ ] Prevent DROP DATABASE command
 
-## Installation
+## Installation using [PGXS](https://www.postgresql.org/docs/current/extend-pgxs.html)
 
 1. Clone the repository.
 2. Navigate to the repository directory.
 3. Run `make` to build the extension.
 4. Run `sudo make install` to install the extension.
+
+## Installation directly using C compiler
+
+1. cc -I$(pg_config --includedir) -c pg_savior.c && cc -bundle -flat_namespace -undefined suppress -o pg_savior.dylib pg_savior.o
+2. sudo cp pg_savior.dylib $(pg_config --libdir)
 
 ## Demo
 

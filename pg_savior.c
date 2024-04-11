@@ -9,7 +9,60 @@
 #include "utils/builtins.h"
 #include <miscadmin.h>
 
-static ExecutorRun_hook_type ExecutorRun_old_hook = NULL;
+#include "omni_v0.h"
+
+PG_MODULE_MAGIC;
+OMNI_MAGIC;
+
+OMNI_MODULE_INFO(.name = "pg_savior", .version = "1.0.0",
+                 .identity = "7005f29d-22ef-4c81-aff5-975dac62ad33");
+
+PG_FUNCTION_INFO_V1(show_saved);
+
+// this function is used to show the saved queries
+// it's just a wrapper around select * from saved_queries
+Datum show_saved(PG_FUNCTION_ARGS) {
+  int ret;
+  TupleDesc tupdesc;
+  Tuplestorestate *tupstore;
+  MemoryContext oldcontext;
+  ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+  SPI_connect();
+
+  ret = SPI_execute("SELECT * FROM saved_queries", true, 0);
+
+  if (ret != SPI_OK_SELECT)
+    elog(ERROR, "SPI_execute failed: error code %d", ret);
+
+  /* Switch to long-lived context to build tuplestore in */
+  oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+  /* Build a tuple descriptor for our result type */
+  if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+    elog(ERROR, "return type must be a row type");
+
+  tupstore = tuplestore_begin_heap(true, false, work_mem);
+
+  /* Put tuples into tuplestore */
+  for (int i = 0; i < SPI_processed; i++) {
+    HeapTuple tuple;
+    tuple = SPI_copytuple(SPI_tuptable->vals[i]);
+    tuplestore_puttuple(tupstore, tuple);
+  }
+
+  /* Clean up and return the tuplestore */
+  SPI_finish();
+  tuplestore_donestoring(tupstore);
+
+  MemoryContextSwitchTo(oldcontext);
+
+  rsinfo->returnMode = SFRM_Materialize;
+  rsinfo->setResult = tupstore;
+  rsinfo->setDesc = tupdesc;
+
+  PG_RETURN_NULL();
+}
 
 // insert the query into the saved_queries table
 static void insert_meta(QueryDesc *qd) {
@@ -82,92 +135,36 @@ bool walkPlanTree(Plan *plan) {
   return hasWhereClause;
 }
 
-static void ExecutorRun_hook_savior(QueryDesc *queryDesc,
+static void ExecutorRun_hook_savior(omni_hook_handle *handle, QueryDesc *queryDesc,
                                     ScanDirection direction, uint64 count,
                                     bool execute_once) {
-  if (ExecutorRun_old_hook)
-    ExecutorRun_old_hook(queryDesc, direction, count, execute_once);
-  else
+    Plan *plan;
     switch (queryDesc->operation) {
     case CMD_DELETE:
       elog(INFO, "pg_savior: DELETE statement detected");
-      Plan *plan = queryDesc->plannedstmt->planTree;
+      plan = queryDesc->plannedstmt->planTree;
       if (queryDesc->params == NULL) {
-        // non parameterized DELETE statement detected
-        // char *s = nodeToString(plan);
-        // elog(INFO, "pg_savior: planTree: %s", s);
-        if (walkPlanTree(plan)) {
-          // WHERE clause found in non parameterized "DELETE" statement
-          standard_ExecutorRun(queryDesc, direction, count, execute_once);
-        } else {
+        if (!walkPlanTree(plan)) {
           // WHERE clause NOT found in non parameterized "DELETE" statement
           elog(INFO,
                "pg_savior: WHERE clause is mandatory for a DELETE statement");
           insert_meta(queryDesc);
-        }
-        break;
-      } else {
-        // The query is parameterized
-        standard_ExecutorRun(queryDesc, direction, count, execute_once);
+          // makes it to not run any other hook
+          handle->next_action = hook_next_action_finish;
+          break;
+        } 
       }
     default:
-      // any queries other than DELETE
-      standard_ExecutorRun(queryDesc, direction, count, execute_once);
+      break;
     }
 }
 
-void _PG_init(void);
-
-void _PG_init() {
-  ExecutorRun_old_hook = ExecutorRun_hook;
-  ExecutorRun_hook = ExecutorRun_hook_savior;
-}
-
-PG_MODULE_MAGIC;
-
-PG_FUNCTION_INFO_V1(show_saved);
-
-// this function is used to show the saved queries
-// it's just a wrapper around select * from saved_queries
-Datum show_saved(PG_FUNCTION_ARGS) {
-  int ret;
-  TupleDesc tupdesc;
-  Tuplestorestate *tupstore;
-  MemoryContext oldcontext;
-  ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
-
-  SPI_connect();
-
-  ret = SPI_execute("SELECT * FROM saved_queries", true, 0);
-
-  if (ret != SPI_OK_SELECT)
-    elog(ERROR, "SPI_execute failed: error code %d", ret);
-
-  /* Switch to long-lived context to build tuplestore in */
-  oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-
-  /* Build a tuple descriptor for our result type */
-  if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-    elog(ERROR, "return type must be a row type");
-
-  tupstore = tuplestore_begin_heap(true, false, work_mem);
-
-  /* Put tuples into tuplestore */
-  for (int i = 0; i < SPI_processed; i++) {
-    HeapTuple tuple;
-    tuple = SPI_copytuple(SPI_tuptable->vals[i]);
-    tuplestore_puttuple(tupstore, tuple);
-  }
-
-  /* Clean up and return the tuplestore */
-  SPI_finish();
-  tuplestore_donestoring(tupstore);
-
-  MemoryContextSwitchTo(oldcontext);
-
-  rsinfo->returnMode = SFRM_Materialize;
-  rsinfo->setResult = tupstore;
-  rsinfo->setDesc = tupdesc;
-
-  PG_RETURN_NULL();
+void _Omni_init(const omni_handle *handle){ 
+  omni_hook executor_hook;
+  elog(INFO, "pg_savior: omni module loaded");
+  executor_hook.type = omni_hook_executor_run;
+  executor_hook.name = "pg_savior_executor_run_hook";
+  executor_hook.fn.executor_run = ExecutorRun_hook_savior; 
+  executor_hook.wrap=true;
+  handle->register_hook(handle, &executor_hook);
 }

@@ -5,11 +5,11 @@ create table saved_queries
     executed_at timestamp not null default now()
 );
 
-CREATE OR REPLACE FUNCTION
+CREATE FUNCTION
 show_saved() RETURNS table
 (
     id integer,
     query text,
     executed_at timestamp
-) AS 'MODULE_PATHNAME','show_saved'
+) AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
