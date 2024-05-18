@@ -1,0 +1,49 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+instance:
+  init:
+    - create extension pg_savior
+    - create table emp
+      (
+          id int
+      )
+tests:
+  - name: "RD0003: pg_savior: update with where clause is applied"
+    steps:
+      - query: "insert into emp values (1)"
+      - query: "insert into emp values (2)"
+      - query: "select count(*) as count from emp where id=1"
+        results:
+          - count: 1
+      - query: "select count(*) as count from emp where id=10"
+        results:
+          - count: 0
+
+      - query: "update emp set id=10 where id = 1"
+      - query: "select count(*) as count from emp where id=1"
+        results:
+          - count: 0
+      - query: "select count(*) as count from emp where id=10"
+        results:
+          - count: 1
+
+  - name: "RD0003: pg_savior: update without where clause is not applied"
+    steps:
+      - query: "insert into emp values (1)"
+      - query: "insert into emp values (2)"
+      - query: "select count(*) as count from emp where id=1"
+        results:
+          - count: 1
+      - query: "select count(*) as count from emp where id=10"
+        results:
+          - count: 0
+
+      - query: "update emp set id=10"
+      - query: "select count(*) as count from emp where id=1"
+        results:
+          - count: 1
+      - query: "select count(*) as count from emp where id=10"
+        results:
+          - count: 0
+      - query: "select query from saved_queries order by id desc limit 1"
+        results:
+          - query: "update emp set id=10"

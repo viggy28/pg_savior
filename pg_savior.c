@@ -33,6 +33,18 @@ static void insert_meta(QueryDesc *qd) {
 
 bool walkPlanTree(Plan *plan);
 
+static bool ensureWhereClause(QueryDesc *queryDesc) {
+  Plan *plan = queryDesc->plannedstmt->planTree;
+  if (queryDesc->params != NULL) {
+    // non parameterized DELETE statement detected
+    // char *s = nodeToString(plan);
+    // elog(INFO, "pg_savior: planTree: %s", s);
+    return true;
+  }
+
+  return walkPlanTree(plan);
+}
+
 // walk the plan tree to find if there is a WHERE clause
 bool walkPlanTree(Plan *plan) {
   bool hasWhereClause = false;
@@ -91,27 +103,22 @@ static void ExecutorRun_hook_savior(QueryDesc *queryDesc,
     switch (queryDesc->operation) {
     case CMD_DELETE:
       elog(INFO, "pg_savior: DELETE statement detected");
-      Plan *plan = queryDesc->plannedstmt->planTree;
-      if (queryDesc->params == NULL) {
-        // non parameterized DELETE statement detected
-        // char *s = nodeToString(plan);
-        // elog(INFO, "pg_savior: planTree: %s", s);
-        if (walkPlanTree(plan)) {
-          // WHERE clause found in non parameterized "DELETE" statement
-          standard_ExecutorRun(queryDesc, direction, count, execute_once);
-        } else {
-          // WHERE clause NOT found in non parameterized "DELETE" statement
-          elog(INFO,
-               "pg_savior: WHERE clause is mandatory for a DELETE statement");
-          insert_meta(queryDesc);
-        }
-        break;
-      } else {
-        // The query is parameterized
+      if (ensureWhereClause(queryDesc)) {
         standard_ExecutorRun(queryDesc, direction, count, execute_once);
+      } else {
+        elog(INFO, "pg_savior: WHERE clause is mandatory for a DELETE statement");
+        insert_meta(queryDesc);
       }
+      break;
+    case CMD_UPDATE:
+      if (ensureWhereClause(queryDesc)) {
+        standard_ExecutorRun(queryDesc, direction, count, execute_once);
+      } else {
+        elog(INFO, "pg_savior: WHERE clause is mandatory for an UPDATE statement");
+        insert_meta(queryDesc);
+      }
+      break;
     default:
-      // any queries other than DELETE
       standard_ExecutorRun(queryDesc, direction, count, execute_once);
     }
 }
