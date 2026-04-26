@@ -32,4 +32,7 @@ ALTER TABLE big_emp ADD COLUMN x1 int, ADD COLUMN x2 int DEFAULT 0;
 -- Multiple commands without any default: allowed
 ALTER TABLE big_emp ADD COLUMN y1 int, ADD COLUMN y2 int;
 
+-- Cleanup: bypass the new DROP TABLE guard since we lowered the threshold
+SET pg_savior.bypass = on;
 DROP TABLE big_emp;
+RESET pg_savior.bypass;

@@ -13,9 +13,11 @@ Under active development. Pre-1.0. Not production-ready.
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [x] Block `CREATE INDEX` without `CONCURRENTLY`
 - [x] Block `ALTER TABLE ADD COLUMN ... DEFAULT` on large tables
+- [x] Block `DROP TABLE` on large tables
+- [x] Block `DROP DATABASE`
 - [x] Per-session bypass GUC (`pg_savior.bypass`)
 - [x] Global on/off GUC (`pg_savior.enabled`)
-- [ ] Block other destructive DDL (`DROP TABLE`, `TRUNCATE`, `DROP DATABASE`)
+- [ ] Block `TRUNCATE`
 - [ ] Per-table opt-out via reloptions
 
 ## Installation
@@ -129,6 +131,14 @@ HINT:  Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), or 
 postgres=# ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
 ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (5000000 rows) is blocked
 HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+
+postgres=# DROP TABLE big_emp;
+ERROR:  pg_savior: DROP TABLE on a large table "big_emp" (5000000 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+
+postgres=# DROP DATABASE production_db;
+ERROR:  pg_savior: DROP DATABASE "production_db" is blocked
+HINT:  Set pg_savior.bypass = on for this session if you really mean it.
 ```
 
 The ADD COLUMN guard is conservative — it blocks any DEFAULT on a large table, even non-volatile ones that PG14+ handles via fast-default and would not actually rewrite. If you frequently add non-volatile defaults, raise `pg_savior.large_table_threshold_rows` or use bypass.
@@ -174,6 +184,10 @@ pg_savior installs three hooks:
 
 2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, reads the planner's row estimate from the source plan beneath the `ModifyTable` node and raises `ERROR` if it exceeds the threshold. The transaction aborts before any tuples are touched.
 
-3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses `CREATE INDEX` without `CONCURRENTLY`, and `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table's `pg_class.reltuples` exceeds `pg_savior.large_table_threshold_rows`.
+3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses:
+   - `CREATE INDEX` without `CONCURRENTLY` (always)
+   - `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table's `pg_class.reltuples` exceeds `pg_savior.large_table_threshold_rows`
+   - `DROP TABLE` when any target table's `pg_class.reltuples` exceeds the same threshold (multi-table drops blocked if *any* target is large)
+   - `DROP DATABASE` (always)
 
 All checks honour `pg_savior.enabled` and `pg_savior.bypass`.
