@@ -1,0 +1,80 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+CREATE TABLE emp (id int);
+INSERT INTO emp SELECT generate_series(1, 1000);
+ANALYZE emp;
+-- Default: max_rows_affected = 0, check disabled. WHERE id > 0 estimated ~1000 rows, allowed.
+SELECT current_setting('pg_savior.max_rows_affected') AS max_rows;
+ max_rows 
+----------
+ 0
+(1 row)
+
+DELETE FROM emp WHERE id > 999;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+      999
+(1 row)
+
+-- Threshold = 10. DELETE estimated to touch all remaining rows must be blocked.
+SET pg_savior.max_rows_affected = 10;
+DELETE FROM emp WHERE id > 0;
+ERROR:  pg_savior: DELETE estimated to affect 1000 rows, exceeds pg_savior.max_rows_affected (10)
+HINT:  Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+      999
+(1 row)
+
+-- Under-threshold DELETE succeeds.
+DELETE FROM emp WHERE id <= 5;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+      994
+(1 row)
+
+-- UPDATE over threshold also blocked.
+UPDATE emp SET id = id + 10000 WHERE id > 0;
+ERROR:  pg_savior: UPDATE estimated to affect 1000 rows, exceeds pg_savior.max_rows_affected (10)
+HINT:  Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+      994
+(1 row)
+
+-- Under-threshold UPDATE succeeds.
+UPDATE emp SET id = id + 10000 WHERE id <= 10;
+SELECT count(*) AS unchanged FROM emp WHERE id <= 10;
+ unchanged 
+-----------
+         0
+(1 row)
+
+-- bypass overrides the row-count check.
+SET pg_savior.bypass = on;
+DELETE FROM emp WHERE id > 0;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        0
+(1 row)
+
+RESET pg_savior.bypass;
+-- Refilling so we can re-test the disable path
+INSERT INTO emp SELECT generate_series(1, 1000);
+ANALYZE emp;
+-- Setting threshold back to 0 disables the check; the over-estimate succeeds.
+SET pg_savior.max_rows_affected = 0;
+DELETE FROM emp WHERE id > 0;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        0
+(1 row)
+
+DROP TABLE emp;

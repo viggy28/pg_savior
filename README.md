@@ -10,10 +10,10 @@ Under active development. Pre-1.0. Not production-ready.
 
 - [x] Block `DELETE` without `WHERE`
 - [x] Block `UPDATE` without `WHERE`
+- [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [x] Per-session bypass GUC (`pg_savior.bypass`)
 - [x] Global on/off GUC (`pg_savior.enabled`)
 - [ ] Block destructive DDL (`DROP TABLE`, `TRUNCATE`, `DROP DATABASE`, `CREATE INDEX` without `CONCURRENTLY`)
-- [ ] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [ ] Per-table opt-out via reloptions
 
 ## Installation
@@ -90,7 +90,8 @@ DELETE 1
 | GUC | Default | Scope | Effect |
 |---|---|---|---|
 | `pg_savior.enabled` | `on` | session (`USERSET`) | Master switch. When `off`, no checks run. |
-| `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, the current session's `DELETE`/`UPDATE` without `WHERE` are allowed through. Use to do an intentional bulk operation. |
+| `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, the current session's `DELETE`/`UPDATE` are allowed through unconditionally. Use to do an intentional bulk operation. |
+| `pg_savior.max_rows_affected` | `0` (disabled) | session (`USERSET`) | When > 0, refuse `DELETE`/`UPDATE` whose planner row estimate exceeds this. Catches destructive queries that *do* have a `WHERE` but match too much (e.g. `DELETE FROM emp WHERE id > 0`). |
 
 Example bypass for an intentional cleanup:
 
@@ -100,6 +101,18 @@ SET LOCAL pg_savior.bypass = on;
 DELETE FROM staging_table;
 COMMIT;
 ```
+
+Example row-count guard for a destructive query that has a WHERE but matches too much:
+
+```sql
+postgres=# SET pg_savior.max_rows_affected = 100;
+SET
+postgres=# DELETE FROM emp WHERE id > 0;
+ERROR:  pg_savior: DELETE estimated to affect 1000 rows, exceeds pg_savior.max_rows_affected (100)
+HINT:  Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.
+```
+
+The threshold uses the planner's row estimate, which depends on table statistics. For accurate enforcement on a recently-modified table, run `ANALYZE` first.
 
 ## Tests
 
@@ -136,9 +149,10 @@ If you change a test's SQL, regenerate its expected output:
 
 ## How it works
 
-pg_savior installs a `post_parse_analyze_hook`. After Postgres parses a statement and resolves names against the catalog, the hook inspects the `Query` tree. If the statement is a `CMD_DELETE` or `CMD_UPDATE` and `query->jointree->quals` is `NULL` (no `WHERE` clause), it calls `ereport(ERROR, ...)`, which aborts the transaction.
+pg_savior installs two hooks:
 
-This intercepts *before* planning runs, so:
-- The check is independent of plan shape (no special-casing of `IndexScan`, `HashJoin`, etc.)
-- Parameterized statements are handled correctly
-- No planner work is wasted on a query that will be refused
+1. **`post_parse_analyze_hook`** — fires after parse-analyze, before planning. Inspects the `Query` tree: if the statement is `CMD_DELETE`/`CMD_UPDATE` and `query->jointree->quals` is `NULL` (no `WHERE`), it raises `ERROR`. Independent of plan shape; parameterized statements handled correctly; no planner work wasted on a query that will be refused.
+
+2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, reads the planner's row estimate from the source plan beneath the `ModifyTable` node and raises `ERROR` if it exceeds the threshold. The transaction aborts before any tuples are touched.
+
+Both checks honour `pg_savior.enabled` and `pg_savior.bypass`.
