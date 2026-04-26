@@ -18,6 +18,8 @@ Under active development. Pre-1.0. Not production-ready.
 
 ## Installation
 
+Build from source, or [download from PGXN](https://pgxn.org/extension/pg_savior).
+
 ```bash
 make
 sudo make install
