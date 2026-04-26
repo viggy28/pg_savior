@@ -1,0 +1,29 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+-- Setup: ensure the test database is gone, then create it. Do both with
+-- bypass on so we don't hit the guard during setup.
+SET pg_savior.bypass = on;
+DROP DATABASE IF EXISTS pg_savior_drop_test_db;
+NOTICE:  database "pg_savior_drop_test_db" does not exist, skipping
+CREATE DATABASE pg_savior_drop_test_db;
+RESET pg_savior.bypass;
+-- Default: DROP DATABASE always blocked
+DROP DATABASE pg_savior_drop_test_db;
+ERROR:  pg_savior: DROP DATABASE "pg_savior_drop_test_db" is blocked
+HINT:  Set pg_savior.bypass = on for this session if you really mean it.
+-- DROP DATABASE IF EXISTS: still blocked (we refuse before standard handler decides)
+DROP DATABASE IF EXISTS pg_savior_drop_test_db;
+ERROR:  pg_savior: DROP DATABASE "pg_savior_drop_test_db" is blocked
+HINT:  Set pg_savior.bypass = on for this session if you really mean it.
+-- Bypass: succeeds
+SET pg_savior.bypass = on;
+DROP DATABASE pg_savior_drop_test_db;
+RESET pg_savior.bypass;
+-- Disabled: also allowed
+SET pg_savior.bypass = on;
+CREATE DATABASE pg_savior_drop_test_db;
+RESET pg_savior.bypass;
+SET pg_savior.enabled = off;
+DROP DATABASE pg_savior_drop_test_db;
+SET pg_savior.enabled = on;

@@ -34,4 +34,7 @@ ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (100 row
 HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 -- Multiple commands without any default: allowed
 ALTER TABLE big_emp ADD COLUMN y1 int, ADD COLUMN y2 int;
+-- Cleanup: bypass the new DROP TABLE guard since we lowered the threshold
+SET pg_savior.bypass = on;
 DROP TABLE big_emp;
+RESET pg_savior.bypass;

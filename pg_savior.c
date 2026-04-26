@@ -3,6 +3,7 @@
 #include <fmgr.h>
 // clang-format on
 #include "access/relation.h"
+#include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
@@ -181,6 +182,46 @@ pg_savior_check_alter_table(AlterTableStmt *stmt)
 }
 
 static void
+pg_savior_check_drop(DropStmt *stmt)
+{
+	ListCell *lc;
+
+	/* Only guard DROP TABLE; other relkinds (view, sequence, ...) pass through */
+	if (stmt->removeType != OBJECT_TABLE)
+		return;
+
+	foreach (lc, stmt->objects)
+	{
+		List	   *name_list = (List *) lfirst(lc);
+		RangeVar   *rv = makeRangeVarFromNameList(name_list);
+		double		reltuples = pg_savior_relation_tuples(rv);
+
+		/* Relation does not exist (or no privilege): let standard handler decide */
+		if (reltuples < 0)
+			continue;
+
+		if (reltuples <= pg_savior_large_table_threshold_rows)
+			continue;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_RAISE_EXCEPTION),
+				 errmsg("pg_savior: DROP TABLE on a large table \"%s\" (%.0f rows) is blocked",
+						rv->relname, reltuples),
+				 errhint("Verify the target, raise pg_savior.large_table_threshold_rows, "
+						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
+	}
+}
+
+static void
+pg_savior_check_drop_database(DropdbStmt *stmt)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_RAISE_EXCEPTION),
+			 errmsg("pg_savior: DROP DATABASE \"%s\" is blocked", stmt->dbname),
+			 errhint("Set pg_savior.bypass = on for this session if you really mean it.")));
+}
+
+static void
 pg_savior_ProcessUtility(PlannedStmt *pstmt,
 						 const char *queryString,
 						 bool readOnlyTree,
@@ -198,6 +239,10 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 			pg_savior_check_create_index((IndexStmt *) parsetree);
 		else if (IsA(parsetree, AlterTableStmt))
 			pg_savior_check_alter_table((AlterTableStmt *) parsetree);
+		else if (IsA(parsetree, DropStmt))
+			pg_savior_check_drop((DropStmt *) parsetree);
+		else if (IsA(parsetree, DropdbStmt))
+			pg_savior_check_drop_database((DropdbStmt *) parsetree);
 	}
 
 	if (prev_ProcessUtility_hook)
