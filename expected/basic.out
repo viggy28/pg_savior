@@ -1,0 +1,20 @@
+LOAD 'pg_savior';
+CREATE EXTENSION pg_savior;
+SELECT count(*) AS installed FROM pg_extension WHERE extname = 'pg_savior';
+ installed 
+-----------
+         1
+(1 row)
+
+SHOW pg_savior.enabled;
+ pg_savior.enabled 
+-------------------
+ on
+(1 row)
+
+SHOW pg_savior.bypass;
+ pg_savior.bypass 
+------------------
+ off
+(1 row)
+
