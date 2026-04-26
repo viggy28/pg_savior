@@ -1,0 +1,12 @@
+.git
+.idea
+.vscode
+.claude
+*.dylib
+*.so
+*.o
+results
+regression.diffs
+regression.out
+plan.md
+docker

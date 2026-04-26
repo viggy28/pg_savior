@@ -1,0 +1,35 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+CREATE TABLE emp (id int);
+CREATE TABLE dept (id int);
+INSERT INTO emp VALUES (1), (2), (3);
+INSERT INTO dept VALUES (1);
+-- DELETE without WHERE: must error, table unchanged
+DELETE FROM emp;
+ERROR:  pg_savior: DELETE without WHERE clause is blocked
+HINT:  Add a WHERE clause, or set pg_savior.bypass = on for this session.
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        3
+(1 row)
+
+-- DELETE with WHERE: succeeds
+DELETE FROM emp WHERE id = 1;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        2
+(1 row)
+
+-- DELETE with subquery WHERE: succeeds (no HashJoin special case needed)
+DELETE FROM emp WHERE id IN (SELECT id FROM dept);
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        2
+(1 row)
+
+DROP TABLE emp;
+DROP TABLE dept;

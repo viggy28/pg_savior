@@ -1,0 +1,37 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+CREATE TABLE emp (id int);
+INSERT INTO emp VALUES (1), (2), (3);
+-- Default: blocked
+DELETE FROM emp;
+ERROR:  pg_savior: DELETE without WHERE clause is blocked
+HINT:  Add a WHERE clause, or set pg_savior.bypass = on for this session.
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        3
+(1 row)
+
+-- Bypass on: allowed
+SET pg_savior.bypass = on;
+DELETE FROM emp;
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        0
+(1 row)
+
+-- Reset: blocked again
+INSERT INTO emp VALUES (1);
+RESET pg_savior.bypass;
+DELETE FROM emp;
+ERROR:  pg_savior: DELETE without WHERE clause is blocked
+HINT:  Add a WHERE clause, or set pg_savior.bypass = on for this session.
+SELECT count(*) AS rowcount FROM emp;
+ rowcount 
+----------
+        1
+(1 row)
+
+DROP TABLE emp;
