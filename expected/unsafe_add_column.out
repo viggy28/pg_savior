@@ -21,7 +21,7 @@ INSERT INTO big_emp SELECT generate_series(1, 100);
 ANALYZE big_emp;
 ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
 ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (100 rows) is blocked
-HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 -- ADD COLUMN without default: always allowed (no rewrite risk)
 ALTER TABLE big_emp ADD COLUMN status text;
 -- Same large table: bypass overrides
@@ -31,7 +31,7 @@ RESET pg_savior.bypass;
 -- Multiple commands in one ALTER: blocked if any AddColumn has a default
 ALTER TABLE big_emp ADD COLUMN x1 int, ADD COLUMN x2 int DEFAULT 0;
 ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (100 rows) is blocked
-HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 -- Multiple commands without any default: allowed
 ALTER TABLE big_emp ADD COLUMN y1 int, ADD COLUMN y2 int;
 -- Cleanup: bypass the new DROP TABLE guard since we lowered the threshold

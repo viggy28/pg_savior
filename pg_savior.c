@@ -142,6 +142,29 @@ column_has_default(ColumnDef *col)
 	return false;
 }
 
+/*
+ * Decide whether this AlterTableCmd is the kind that triggers a rewrite of a
+ * large table. Returns the human-readable name of the dangerous operation, or
+ * NULL if the cmd is harmless.
+ */
+static const char *
+pg_savior_alter_table_op(AlterTableCmd *cmd)
+{
+	switch (cmd->subtype)
+	{
+		case AT_AddColumn:
+			if (column_has_default((ColumnDef *) cmd->def))
+				return "ADD COLUMN with DEFAULT";
+			return NULL;
+
+		case AT_AlterColumnType:
+			return "ALTER COLUMN TYPE";
+
+		default:
+			return NULL;
+	}
+}
+
 static void
 pg_savior_check_alter_table(AlterTableStmt *stmt)
 {
@@ -151,13 +174,9 @@ pg_savior_check_alter_table(AlterTableStmt *stmt)
 	foreach (lc, stmt->cmds)
 	{
 		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-		ColumnDef  *col;
+		const char *op = pg_savior_alter_table_op(cmd);
 
-		if (cmd->subtype != AT_AddColumn)
-			continue;
-
-		col = (ColumnDef *) cmd->def;
-		if (!column_has_default(col))
+		if (op == NULL)
 			continue;
 
 		/* Lazy lookup: only inspect the relation once, only if needed */
@@ -172,12 +191,36 @@ pg_savior_check_alter_table(AlterTableStmt *stmt)
 
 		ereport(ERROR,
 				(errcode(ERRCODE_RAISE_EXCEPTION),
-				 errmsg("pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (%.0f rows) is blocked",
-						reltuples),
-				 errhint("Adding a column with a volatile default rewrites the whole table. "
-						 "Add the column without a default first, then backfill in batches; "
-						 "raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. "
-						 "Run ANALYZE if the row estimate looks wrong.")));
+				 errmsg("pg_savior: ALTER TABLE %s on a large table (%.0f rows) is blocked",
+						op, reltuples),
+				 errhint("This operation rewrites the whole table. "
+						 "Plan a batched migration; raise pg_savior.large_table_threshold_rows; "
+						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
+	}
+}
+
+static void
+pg_savior_check_truncate(TruncateStmt *stmt)
+{
+	ListCell *lc;
+
+	foreach (lc, stmt->relations)
+	{
+		RangeVar   *rv = (RangeVar *) lfirst(lc);
+		double		reltuples = pg_savior_relation_tuples(rv);
+
+		if (reltuples < 0)
+			continue;
+
+		if (reltuples <= pg_savior_large_table_threshold_rows)
+			continue;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_RAISE_EXCEPTION),
+				 errmsg("pg_savior: TRUNCATE on a large table \"%s\" (%.0f rows) is blocked",
+						rv->relname, reltuples),
+				 errhint("Verify the target, raise pg_savior.large_table_threshold_rows, "
+						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
 	}
 }
 
@@ -243,6 +286,8 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 			pg_savior_check_drop((DropStmt *) parsetree);
 		else if (IsA(parsetree, DropdbStmt))
 			pg_savior_check_drop_database((DropdbStmt *) parsetree);
+		else if (IsA(parsetree, TruncateStmt))
+			pg_savior_check_truncate((TruncateStmt *) parsetree);
 	}
 
 	if (prev_ProcessUtility_hook)
