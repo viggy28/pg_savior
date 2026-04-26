@@ -11,9 +11,11 @@ Under active development. Pre-1.0. Not production-ready.
 - [x] Block `DELETE` without `WHERE`
 - [x] Block `UPDATE` without `WHERE`
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
+- [x] Block `CREATE INDEX` without `CONCURRENTLY`
+- [x] Block `ALTER TABLE ADD COLUMN ... DEFAULT` on large tables
 - [x] Per-session bypass GUC (`pg_savior.bypass`)
 - [x] Global on/off GUC (`pg_savior.enabled`)
-- [ ] Block destructive DDL (`DROP TABLE`, `TRUNCATE`, `DROP DATABASE`, `CREATE INDEX` without `CONCURRENTLY`)
+- [ ] Block other destructive DDL (`DROP TABLE`, `TRUNCATE`, `DROP DATABASE`)
 - [ ] Per-table opt-out via reloptions
 
 ## Installation
@@ -94,6 +96,7 @@ DELETE 1
 | `pg_savior.enabled` | `on` | session (`USERSET`) | Master switch. When `off`, no checks run. |
 | `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, the current session's `DELETE`/`UPDATE` are allowed through unconditionally. Use to do an intentional bulk operation. |
 | `pg_savior.max_rows_affected` | `0` (disabled) | session (`USERSET`) | When > 0, refuse `DELETE`/`UPDATE` whose planner row estimate exceeds this. Catches destructive queries that *do* have a `WHERE` but match too much (e.g. `DELETE FROM emp WHERE id > 0`). |
+| `pg_savior.large_table_threshold_rows` | `1000000` | session (`USERSET`) | Tables with `pg_class.reltuples` greater than this are considered "large" for the DDL guards (currently: `ALTER TABLE ADD COLUMN ... DEFAULT`). Raise it for permissive environments, lower it for stricter ones. |
 
 Example bypass for an intentional cleanup:
 
@@ -115,6 +118,20 @@ HINT:  Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_sav
 ```
 
 The threshold uses the planner's row estimate, which depends on table statistics. For accurate enforcement on a recently-modified table, run `ANALYZE` first.
+
+Example DDL guards:
+
+```
+postgres=# CREATE INDEX emp_idx ON emp (id);
+ERROR:  pg_savior: CREATE INDEX without CONCURRENTLY is blocked
+HINT:  Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), or set pg_savior.bypass = on for this session.
+
+postgres=# ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
+ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (5000000 rows) is blocked
+HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+```
+
+The ADD COLUMN guard is conservative — it blocks any DEFAULT on a large table, even non-volatile ones that PG14+ handles via fast-default and would not actually rewrite. If you frequently add non-volatile defaults, raise `pg_savior.large_table_threshold_rows` or use bypass.
 
 ## Tests
 
@@ -151,10 +168,12 @@ If you change a test's SQL, regenerate its expected output:
 
 ## How it works
 
-pg_savior installs two hooks:
+pg_savior installs three hooks:
 
 1. **`post_parse_analyze_hook`** — fires after parse-analyze, before planning. Inspects the `Query` tree: if the statement is `CMD_DELETE`/`CMD_UPDATE` and `query->jointree->quals` is `NULL` (no `WHERE`), it raises `ERROR`. Independent of plan shape; parameterized statements handled correctly; no planner work wasted on a query that will be refused.
 
 2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, reads the planner's row estimate from the source plan beneath the `ModifyTable` node and raises `ERROR` if it exceeds the threshold. The transaction aborts before any tuples are touched.
 
-Both checks honour `pg_savior.enabled` and `pg_savior.bypass`.
+3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses `CREATE INDEX` without `CONCURRENTLY`, and `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table's `pg_class.reltuples` exceeds `pg_savior.large_table_threshold_rows`.
+
+All checks honour `pg_savior.enabled` and `pg_savior.bypass`.
