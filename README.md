@@ -2,6 +2,12 @@
 
 pg_savior is a PostgreSQL extension that prevents accidental data loss from `DELETE` and `UPDATE` statements that have no `WHERE` clause. It hooks the parser, raises an `ERROR` on unguarded statements, and aborts the transaction so the application notices.
 
+![pg_savior catching a DELETE without WHERE and a DROP TABLE on a large table](./demo.gif)
+
+> Background: [pg_savior — a seatbelt for Postgres](https://viggy28.dev/article/pg-savior-seatbelt-for-postgres/) explains why this exists and how it's designed.
+>
+> Regenerate the GIF with `vhs demo.tape` (see [demo.tape](./demo.tape)).
+
 ## Status
 
 Under active development. Pre-1.0. Not production-ready.
