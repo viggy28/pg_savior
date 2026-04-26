@@ -1,24 +1,24 @@
 {
    "name": "pg_savior",
-   "abstract": "Prevent accidental data loss",
-   "description": "A PostgreSQL extension that prevents accidental data loss from DELETE and UPDATE statements that have no WHERE clause, or that match more rows than a configured threshold.",
-   "version": "0.0.1",
+   "abstract": "Prevent accidental data loss and risky schema changes",
+   "description": "A PostgreSQL extension that intercepts dangerous statements before they run. Blocks DELETE/UPDATE without a WHERE clause; DELETE/UPDATE whose planner row estimate exceeds a configurable threshold; CREATE INDEX without CONCURRENTLY; ALTER TABLE ADD COLUMN ... DEFAULT and ALTER TABLE ALTER COLUMN TYPE on tables larger than a threshold; TRUNCATE on large tables; DROP TABLE on large tables; and DROP DATABASE. Each guard raises ERROR (aborting the transaction so applications notice) and can be bypassed per-session with pg_savior.bypass = on, or disabled globally with pg_savior.enabled = off.",
+   "version": "0.1.0",
    "maintainer": [
       "viggy28 <villan.lampard.epl@gmail.com>"
    ],
    "license": "mit",
    "provides": {
       "pg_savior": {
-         "abstract": "Prevent accidental data loss",
-         "file": "pg_savior--0.0.1.sql",
+         "abstract": "Prevent accidental data loss and risky schema changes",
+         "file": "pg_savior--0.1.0.sql",
          "docfile": "README.md",
-         "version": "0.0.1"
+         "version": "0.1.0"
       }
    },
    "prereqs": {
       "runtime": {
          "requires": {
-            "PostgreSQL": "10.0.0"
+            "PostgreSQL": "14.0.0"
          }
       }
    },
@@ -32,7 +32,7 @@
          "type": "git"
       }
    },
-   "generated_by": "David E. Wheeler",
+   "generated_by": "viggy28",
    "meta-spec": {
       "version": "1.0.0",
       "url": "https://pgxn.org/meta/spec.txt"
@@ -40,6 +40,12 @@
    "tags": [
       "delete",
       "update",
+      "truncate",
+      "drop",
+      "ddl",
+      "guards",
+      "safety",
+      "operations",
       "data loss",
       "safe"
    ]

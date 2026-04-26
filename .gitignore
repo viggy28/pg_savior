@@ -1,8 +1,11 @@
 *.so
 *.o
 *.dylib
+*.bc
 regression.diffs
 regression.out
+results/
 .idea/
 .vscode/
 plan.md
+pg_savior-*.zip
