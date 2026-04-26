@@ -1,0 +1,84 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+SET pg_savior.large_table_threshold_rows = 10;
+-- Small table: TRUNCATE allowed
+CREATE TABLE small_emp (id int);
+INSERT INTO small_emp SELECT generate_series(1, 5);
+ANALYZE small_emp;
+TRUNCATE small_emp;
+SELECT count(*) AS rowcount FROM small_emp;
+ rowcount 
+----------
+        0
+(1 row)
+
+-- Large table: TRUNCATE blocked
+CREATE TABLE big_emp (id int);
+INSERT INTO big_emp SELECT generate_series(1, 100);
+ANALYZE big_emp;
+TRUNCATE big_emp;
+ERROR:  pg_savior: TRUNCATE on a large table "big_emp" (100 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS rowcount FROM big_emp;
+ rowcount 
+----------
+      100
+(1 row)
+
+-- Multi-target: blocked if any large
+INSERT INTO small_emp SELECT generate_series(1, 5);
+ANALYZE small_emp;
+TRUNCATE small_emp, big_emp;
+ERROR:  pg_savior: TRUNCATE on a large table "big_emp" (100 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+-- Both still populated
+SELECT count(*) AS small_rowcount FROM small_emp;
+ small_rowcount 
+----------------
+              5
+(1 row)
+
+SELECT count(*) AS big_rowcount FROM big_emp;
+ big_rowcount 
+--------------
+          100
+(1 row)
+
+-- Multi-target where all are small: succeeds
+CREATE TABLE small_b (id int);
+INSERT INTO small_b VALUES (1);
+ANALYZE small_b;
+TRUNCATE small_emp, small_b;
+-- TRUNCATE ... CASCADE: same logic (CASCADE doesn't affect our check)
+TRUNCATE big_emp CASCADE;
+ERROR:  pg_savior: TRUNCATE on a large table "big_emp" (100 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+-- Bypass overrides
+SET pg_savior.bypass = on;
+TRUNCATE big_emp;
+RESET pg_savior.bypass;
+SELECT count(*) AS after_bypass FROM big_emp;
+ after_bypass 
+--------------
+            0
+(1 row)
+
+-- Disabled: also allowed
+INSERT INTO big_emp SELECT generate_series(1, 100);
+ANALYZE big_emp;
+SET pg_savior.enabled = off;
+TRUNCATE big_emp;
+SET pg_savior.enabled = on;
+SELECT count(*) AS after_disabled FROM big_emp;
+ after_disabled 
+----------------
+              0
+(1 row)
+
+-- Cleanup
+SET pg_savior.bypass = on;
+DROP TABLE big_emp;
+DROP TABLE small_emp;
+DROP TABLE small_b;
+RESET pg_savior.bypass;

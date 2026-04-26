@@ -13,12 +13,14 @@ Under active development. Pre-1.0. Not production-ready.
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [x] Block `CREATE INDEX` without `CONCURRENTLY`
 - [x] Block `ALTER TABLE ADD COLUMN ... DEFAULT` on large tables
+- [x] Block `ALTER TABLE ALTER COLUMN TYPE` on large tables
+- [x] Block `TRUNCATE` on large tables
 - [x] Block `DROP TABLE` on large tables
 - [x] Block `DROP DATABASE`
 - [x] Per-session bypass GUC (`pg_savior.bypass`)
 - [x] Global on/off GUC (`pg_savior.enabled`)
-- [ ] Block `TRUNCATE`
 - [ ] Per-table opt-out via reloptions
+- [ ] Volatility detection for `ADD COLUMN` (only block volatile defaults)
 
 ## Installation
 
@@ -139,6 +141,14 @@ HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_
 postgres=# DROP DATABASE production_db;
 ERROR:  pg_savior: DROP DATABASE "production_db" is blocked
 HINT:  Set pg_savior.bypass = on for this session if you really mean it.
+
+postgres=# TRUNCATE big_emp;
+ERROR:  pg_savior: TRUNCATE on a large table "big_emp" (5000000 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+
+postgres=# ALTER TABLE big_emp ALTER COLUMN id TYPE bigint;
+ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (5000000 rows) is blocked
+HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 ```
 
 The ADD COLUMN guard is conservative — it blocks any DEFAULT on a large table, even non-volatile ones that PG14+ handles via fast-default and would not actually rewrite. If you frequently add non-volatile defaults, raise `pg_savior.large_table_threshold_rows` or use bypass.
@@ -186,8 +196,12 @@ pg_savior installs three hooks:
 
 3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses:
    - `CREATE INDEX` without `CONCURRENTLY` (always)
-   - `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table's `pg_class.reltuples` exceeds `pg_savior.large_table_threshold_rows`
-   - `DROP TABLE` when any target table's `pg_class.reltuples` exceeds the same threshold (multi-table drops blocked if *any* target is large)
+   - `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table is over the threshold
+   - `ALTER TABLE ALTER COLUMN TYPE` when the target table is over the threshold (rewrites the table)
+   - `TRUNCATE` when any target table is over the threshold (multi-table truncates blocked if *any* target is large)
+   - `DROP TABLE` when any target table is over the threshold (multi-table drops blocked if *any* target is large)
    - `DROP DATABASE` (always)
+
+   "Over the threshold" means `pg_class.reltuples > pg_savior.large_table_threshold_rows`.
 
 All checks honour `pg_savior.enabled` and `pg_savior.bypass`.
