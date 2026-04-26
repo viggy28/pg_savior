@@ -2,11 +2,14 @@
 #include <postgres.h>
 #include <fmgr.h>
 // clang-format on
+#include "access/relation.h"
 #include "executor/executor.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/analyze.h"
+#include "tcop/utility.h"
 #include "utils/guc.h"
+#include "utils/rel.h"
 
 PG_MODULE_MAGIC;
 
@@ -14,10 +17,12 @@ void _PG_init(void);
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 static bool pg_savior_enabled = true;
 static bool pg_savior_bypass = false;
 static int  pg_savior_max_rows_affected = 0;
+static int  pg_savior_large_table_threshold_rows = 1000000;
 
 static void
 pg_savior_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
@@ -76,6 +81,133 @@ pg_savior_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 }
 
+/*
+ * Look up reltuples for a relation by RangeVar, returning -1 if the relation
+ * cannot be opened (does not exist, lacks privileges). Caller must already be
+ * inside a transaction (which is true in any utility-statement context).
+ */
+static double
+pg_savior_relation_tuples(RangeVar *relation)
+{
+	Relation	rel;
+	double		reltuples;
+
+	rel = relation_openrv_extended(relation, AccessShareLock, true);
+	if (rel == NULL)
+		return -1;
+
+	reltuples = rel->rd_rel->reltuples;
+	relation_close(rel, AccessShareLock);
+	return reltuples;
+}
+
+static void
+pg_savior_check_create_index(IndexStmt *stmt)
+{
+	if (stmt->concurrent)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_RAISE_EXCEPTION),
+			 errmsg("pg_savior: CREATE INDEX without CONCURRENTLY is blocked"),
+			 errhint("Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), "
+					 "or set pg_savior.bypass = on for this session.")));
+}
+
+/*
+ * Does this ColumnDef include a DEFAULT clause? The parser represents
+ * column-level DEFAULTs as Constraint nodes with contype = CONSTR_DEFAULT
+ * in col->constraints (not in raw_default, which is reserved for cooked
+ * defaults inherited via CREATE TABLE LIKE etc.).
+ */
+static bool
+column_has_default(ColumnDef *col)
+{
+	ListCell *lc;
+
+	if (col == NULL)
+		return false;
+
+	if (col->raw_default != NULL || col->cooked_default != NULL)
+		return true;
+
+	foreach (lc, col->constraints)
+	{
+		Constraint *con = (Constraint *) lfirst(lc);
+
+		if (con->contype == CONSTR_DEFAULT)
+			return true;
+	}
+	return false;
+}
+
+static void
+pg_savior_check_alter_table(AlterTableStmt *stmt)
+{
+	ListCell   *lc;
+	double		reltuples = -2;	/* -2 = not yet looked up; -1 = lookup failed */
+
+	foreach (lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+		ColumnDef  *col;
+
+		if (cmd->subtype != AT_AddColumn)
+			continue;
+
+		col = (ColumnDef *) cmd->def;
+		if (!column_has_default(col))
+			continue;
+
+		/* Lazy lookup: only inspect the relation once, only if needed */
+		if (reltuples == -2)
+			reltuples = pg_savior_relation_tuples(stmt->relation);
+
+		if (reltuples < 0)	/* relation lookup failed; let standard handler error */
+			return;
+
+		if (reltuples <= pg_savior_large_table_threshold_rows)
+			return;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_RAISE_EXCEPTION),
+				 errmsg("pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (%.0f rows) is blocked",
+						reltuples),
+				 errhint("Adding a column with a volatile default rewrites the whole table. "
+						 "Add the column without a default first, then backfill in batches; "
+						 "raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. "
+						 "Run ANALYZE if the row estimate looks wrong.")));
+	}
+}
+
+static void
+pg_savior_ProcessUtility(PlannedStmt *pstmt,
+						 const char *queryString,
+						 bool readOnlyTree,
+						 ProcessUtilityContext context,
+						 ParamListInfo params,
+						 QueryEnvironment *queryEnv,
+						 DestReceiver *dest,
+						 QueryCompletion *qc)
+{
+	Node *parsetree = pstmt->utilityStmt;
+
+	if (pg_savior_enabled && !pg_savior_bypass)
+	{
+		if (IsA(parsetree, IndexStmt))
+			pg_savior_check_create_index((IndexStmt *) parsetree);
+		else if (IsA(parsetree, AlterTableStmt))
+			pg_savior_check_alter_table((AlterTableStmt *) parsetree);
+	}
+
+	if (prev_ProcessUtility_hook)
+		prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+								 params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+}
+
 void
 _PG_init(void)
 {
@@ -108,9 +240,23 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("pg_savior.large_table_threshold_rows",
+							"Tables with more rows than this are considered \"large\" for the DDL guards.",
+							NULL,
+							&pg_savior_large_table_threshold_rows,
+							1000000,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = pg_savior_post_parse_analyze;
 
 	prev_ExecutorStart_hook = ExecutorStart_hook;
 	ExecutorStart_hook = pg_savior_ExecutorStart;
+
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = pg_savior_ProcessUtility;
 }
