@@ -278,8 +278,21 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 
 	if (pg_savior_enabled && !pg_savior_bypass)
 	{
+		/*
+		 * CREATE TABLE constraints generate constraint IndexStmt subcommands;
+		 * LIKE INCLUDING INDEXES generates transformed ones. Both build indexes
+		 * on a new empty table. Explicit CREATE INDEX commands nested in CREATE
+		 * SCHEMA are also subcommands, but have neither marker and remain guarded.
+		 */
 		if (IsA(parsetree, IndexStmt))
-			pg_savior_check_create_index((IndexStmt *) parsetree);
+		{
+			IndexStmt *stmt = (IndexStmt *) parsetree;
+			bool generated = context == PROCESS_UTILITY_SUBCOMMAND
+				&& (stmt->isconstraint || stmt->transformed);
+
+			if (!generated)
+				pg_savior_check_create_index(stmt);
+		}
 		else if (IsA(parsetree, AlterTableStmt))
 			pg_savior_check_alter_table((AlterTableStmt *) parsetree);
 		else if (IsA(parsetree, DropStmt))
