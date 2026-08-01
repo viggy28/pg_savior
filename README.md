@@ -17,7 +17,7 @@ Pre-1.0: APIs, configuration, and policy defaults may change between releases. T
 - [x] Block `DELETE` without `WHERE`
 - [x] Block `UPDATE` without `WHERE`
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
-- [x] Block `CREATE INDEX` without `CONCURRENTLY`
+- [x] Block unsafe `CREATE INDEX` operations, with partition-aware online workflows
 - [x] Block rewrite-causing `ALTER TABLE ADD COLUMN` operations on large tables
 - [x] Block heap-rewriting `ALTER TABLE ALTER COLUMN TYPE` operations on large tables
 - [x] Block `TRUNCATE` on large tables
@@ -157,6 +157,20 @@ ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (5000000 rows)
 HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 ```
 
+PostgreSQL does not support `CREATE INDEX CONCURRENTLY` directly on a partitioned parent. pg_savior blocks a recursive parent build, but allows PostgreSQL's metadata-only `ON ONLY` workflow:
+
+```sql
+CREATE INDEX events_created_idx ON ONLY events (created_at);
+CREATE INDEX CONCURRENTLY events_2025_created_idx
+  ON events_2025 (created_at);
+ALTER INDEX events_created_idx
+  ATTACH PARTITION events_2025_created_idx;
+```
+
+Repeat the concurrent build and attachment for every leaf partition. For a multi-level partition tree, create an `ON ONLY` index on each intermediate partitioned table, attach its leaf indexes first, and then attach that completed index to its parent. PostgreSQL marks the parent index valid after all child indexes are attached.
+
+`CREATE INDEX ON ONLY` remains blocked for ordinary tables because it still builds the index there. Recursive parent builds and non-concurrent leaf builds also remain blocked. The CREATE INDEX policy is intentionally independent of `pg_savior.large_table_threshold_rows`: lock safety depends on the build method, and even an empty partition tree can later acquire populated partitions. Session bypass and disabled mode retain their normal precedence.
+
 The ALTER COLUMN TYPE guard follows PostgreSQL 14–17's heap-rewrite decision rather than maintaining a list of type pairs. pg_savior transforms a private copy of an explicit `USING` expression against the original relation, applies PostgreSQL's assignment coercion and collation processing, plans the expression, and then uses the same allowed shapes as core: the original column `Var`, optionally wrapped in binary-compatible `RelabelType` nodes, unconstrained `CoerceToDomain` nodes, or timestamp/timestamptz conversion functions when the session time zone is UTC-safe. Type-specific typmod changes that PostgreSQL plans without a rewrite (for example, widening `varchar`) and binary-compatible changes therefore pass; rewrite-causing typmod changes, integer widening, constrained domains, arbitrary `USING` calculations, and timestamp/timestamptz changes in a time zone where core requires conversion are blocked on large physical tables. An explicit identity `USING column_name` is allowed when its planned expression has one of the no-rewrite shapes.
 
 For recursive ALTERs, each physical inheritance child and partition is checked while the root is held at the ALTER's lock level; descendant inspection uses short-lived share locks so PostgreSQL's identity-sequence lock order is preserved. A small or storage-less parent cannot hide a large descendant. `ALTER TABLE ONLY` does not inspect descendants, and storage-less partitioned parents do not contribute a row estimate themselves.
@@ -188,6 +202,7 @@ The safety-matrix suites pair dangerous and safe forms and verify database state
 - `safety_relation_types` — views, partitioned tables, and inherited tables
 - `safety_ddl_edges` — multi-target DDL, index no-ops, generated indexes, constraints, and threshold boundaries
 - `safety_statistics` — deterministic characterization of missing and stale statistics
+- `partitioned_index` — recursive parent rejection, concurrent leaf builds, `ON ONLY`, multi-level attachment, thresholds, and overrides
 
 Literal tautologies such as `WHERE true` count as an explicit `WHERE` clause by design. Enable `pg_savior.max_rows_affected` when protection must be based on estimated impact rather than statement syntax.
 
@@ -242,7 +257,7 @@ pg_savior installs three hooks:
 2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, checks each `ModifyTable` source estimate, including data-modifying CTE subplans, and raises `ERROR` above the threshold. The transaction aborts before any tuples are touched.
 
 3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses:
-   - `CREATE INDEX` without `CONCURRENTLY` (except an `IF NOT EXISTS` no-op)
+   - `CREATE INDEX` without `CONCURRENTLY` (except an `IF NOT EXISTS` no-op and metadata-only `ON ONLY` indexes on partitioned tables); recursive partitioned-parent builds remain blocked, while concurrent leaf builds and `ALTER INDEX ... ATTACH PARTITION` are allowed
    - `ALTER TABLE ADD COLUMN` when the default is volatile or the new column otherwise requires a per-row rewrite (constrained domain, serial/identity, or stored generated column) and the target table is over the threshold
    - `ALTER TABLE ADD` a newly built index-backed constraint, including column-level `UNIQUE`/`PRIMARY KEY`, when the target table is over the threshold; attaching an existing unique index is allowed, while `PRIMARY KEY ... USING INDEX` remains guarded because it may scan to enforce `NOT NULL`
    - `ALTER TABLE ADD` a validated `CHECK`/foreign-key constraint when the target table is over the threshold (`NOT VALID` is allowed)
