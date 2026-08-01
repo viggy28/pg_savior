@@ -5,11 +5,15 @@
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "executor/executor.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
 #include "parser/analyze.h"
+#include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
@@ -24,6 +28,30 @@ static bool pg_savior_enabled = true;
 static bool pg_savior_bypass = false;
 static int  pg_savior_max_rows_affected = 0;
 static int  pg_savior_large_table_threshold_rows = 1000000;
+static int  pg_savior_index_parent_depth = 0;
+
+/* Check top-level DML and data-modifying statements nested in WITH clauses. */
+static void
+pg_savior_check_query(Query *query)
+{
+	ListCell *lc;
+
+	if ((query->commandType == CMD_DELETE || query->commandType == CMD_UPDATE)
+		&& (query->jointree == NULL || query->jointree->quals == NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_RAISE_EXCEPTION),
+				 errmsg("pg_savior: %s without WHERE clause is blocked",
+						query->commandType == CMD_DELETE ? "DELETE" : "UPDATE"),
+				 errhint("Add a WHERE clause, or set pg_savior.bypass = on for this session.")));
+
+	foreach (lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (IsA(cte->ctequery, Query))
+			pg_savior_check_query((Query *) cte->ctequery);
+	}
+}
 
 static void
 pg_savior_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
@@ -34,52 +62,77 @@ pg_savior_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jsta
 	if (!pg_savior_enabled || pg_savior_bypass)
 		return;
 
-	if (query->commandType != CMD_DELETE && query->commandType != CMD_UPDATE)
-		return;
+	pg_savior_check_query(query);
+}
 
-	if (query->jointree != NULL && query->jointree->quals != NULL)
+static void
+pg_savior_check_estimated_rows(CmdType operation, double estimated_rows)
+{
+	if (estimated_rows <= pg_savior_max_rows_affected)
 		return;
 
 	ereport(ERROR,
 			(errcode(ERRCODE_RAISE_EXCEPTION),
-			 errmsg("pg_savior: %s without WHERE clause is blocked",
-					query->commandType == CMD_DELETE ? "DELETE" : "UPDATE"),
-			 errhint("Add a WHERE clause, or set pg_savior.bypass = on for this session.")));
+			 errmsg("pg_savior: %s estimated to affect %.0f rows, exceeds pg_savior.max_rows_affected (%d)",
+					operation == CMD_DELETE ? "DELETE" : "UPDATE",
+					estimated_rows,
+					pg_savior_max_rows_affected),
+			 errhint("Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.")));
+}
+
+/* Walk initialized plan states so data-modifying CTEs are checked too. */
+static bool
+pg_savior_check_planstate(PlanState *planstate, void *context)
+{
+	Plan *plan = planstate->plan;
+
+	(void) context;
+
+	if (IsA(plan, ModifyTable))
+	{
+		ModifyTable *modify = (ModifyTable *) plan;
+
+		if (modify->operation == CMD_DELETE || modify->operation == CMD_UPDATE)
+		{
+			Plan *source_plan = plan->lefttree != NULL ? plan->lefttree : plan;
+
+			pg_savior_check_estimated_rows(modify->operation,
+									 source_plan->plan_rows);
+		}
+	}
+
+	return planstate_tree_walker(planstate, pg_savior_check_planstate, NULL);
 }
 
 static void
 pg_savior_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	if (pg_savior_enabled
+	bool check_estimates = pg_savior_enabled
 		&& !pg_savior_bypass
-		&& pg_savior_max_rows_affected > 0
-		&& (queryDesc->operation == CMD_DELETE || queryDesc->operation == CMD_UPDATE)
+		&& pg_savior_max_rows_affected > 0;
+
+	/* Reject ordinary top-level DML before ExecutorStart acquires its locks. */
+	if (check_estimates
+		&& (queryDesc->operation == CMD_DELETE
+			|| queryDesc->operation == CMD_UPDATE)
 		&& queryDesc->plannedstmt != NULL
 		&& queryDesc->plannedstmt->planTree != NULL)
 	{
-		/*
-		 * The top of the plan tree for DELETE/UPDATE is a ModifyTable node,
-		 * whose plan_rows is 0 unless RETURNING is used. The estimate of
-		 * source rows lives on the child scan/join.
-		 */
-		Plan   *plan = queryDesc->plannedstmt->planTree;
-		Plan   *source_plan = plan->lefttree != NULL ? plan->lefttree : plan;
-		double	estimated_rows = source_plan->plan_rows;
+		Plan *plan = queryDesc->plannedstmt->planTree;
+		Plan *source_plan = plan->lefttree != NULL ? plan->lefttree : plan;
 
-		if (estimated_rows > pg_savior_max_rows_affected)
-			ereport(ERROR,
-					(errcode(ERRCODE_RAISE_EXCEPTION),
-					 errmsg("pg_savior: %s estimated to affect %.0f rows, exceeds pg_savior.max_rows_affected (%d)",
-							queryDesc->operation == CMD_DELETE ? "DELETE" : "UPDATE",
-							estimated_rows,
-							pg_savior_max_rows_affected),
-					 errhint("Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.")));
+		pg_savior_check_estimated_rows(queryDesc->operation,
+								 source_plan->plan_rows);
 	}
 
 	if (prev_ExecutorStart_hook)
 		prev_ExecutorStart_hook(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	/* Initialized plan states expose ModifyTable nodes inside CTE subplans. */
+	if (check_estimates && queryDesc->planstate != NULL)
+		pg_savior_check_planstate(queryDesc->planstate, NULL);
 }
 
 /*
@@ -107,6 +160,32 @@ pg_savior_check_create_index(IndexStmt *stmt)
 {
 	if (stmt->concurrent)
 		return;
+
+	/* An existing same-schema relation makes IF NOT EXISTS a harmless no-op. */
+	if (stmt->if_not_exists && stmt->idxname != NULL)
+	{
+		Relation rel = relation_openrv_extended(stmt->relation,
+										ShareLock, true);
+
+		if (rel != NULL)
+		{
+			Oid namespace = RelationGetNamespace(rel);
+			Oid existing = get_relname_relid(stmt->idxname, namespace);
+
+			if (OidIsValid(existing))
+			{
+				/* Lock heap then index, matching CREATE INDEX lock order. */
+				LockRelationOid(existing, ShareLock);
+				if (get_relname_relid(stmt->idxname, namespace) == existing)
+				{
+					relation_close(rel, NoLock);
+					return;
+				}
+				UnlockRelationOid(existing, ShareLock);
+			}
+			relation_close(rel, ShareLock);
+		}
+	}
 
 	ereport(ERROR,
 			(errcode(ERRCODE_RAISE_EXCEPTION),
@@ -147,6 +226,26 @@ column_has_default(ColumnDef *col)
  * large table. Returns the human-readable name of the dangerous operation, or
  * NULL if the cmd is harmless.
  */
+static bool
+column_has_index_constraint(ColumnDef *col)
+{
+	ListCell *lc;
+
+	if (col == NULL)
+		return false;
+
+	foreach (lc, col->constraints)
+	{
+		Constraint *con = (Constraint *) lfirst(lc);
+
+		if (con->contype == CONSTR_PRIMARY
+			|| con->contype == CONSTR_UNIQUE
+			|| con->contype == CONSTR_EXCLUSION)
+			return true;
+	}
+	return false;
+}
+
 static const char *
 pg_savior_alter_table_op(AlterTableCmd *cmd)
 {
@@ -155,10 +254,32 @@ pg_savior_alter_table_op(AlterTableCmd *cmd)
 		case AT_AddColumn:
 			if (column_has_default((ColumnDef *) cmd->def))
 				return "ADD COLUMN with DEFAULT";
+			if (column_has_index_constraint((ColumnDef *) cmd->def))
+				return "ADD COLUMN with index-backed CONSTRAINT";
 			return NULL;
 
 		case AT_AlterColumnType:
 			return "ALTER COLUMN TYPE";
+
+		case AT_AddConstraint:
+		{
+			Constraint *con = (Constraint *) cmd->def;
+
+			if (con == NULL)
+				return NULL;
+			if (con->indexname == NULL
+				&& (con->contype == CONSTR_PRIMARY
+					|| con->contype == CONSTR_UNIQUE
+					|| con->contype == CONSTR_EXCLUSION))
+				return "ADD index-backed CONSTRAINT";
+			if (con->indexname != NULL && con->contype == CONSTR_PRIMARY)
+				return "ADD PRIMARY KEY USING INDEX";
+			if (!con->skip_validation
+				&& (con->contype == CONSTR_CHECK
+					|| con->contype == CONSTR_FOREIGN))
+				return "ADD validated CONSTRAINT";
+			return NULL;
+		}
 
 		default:
 			return NULL;
@@ -193,8 +314,8 @@ pg_savior_check_alter_table(AlterTableStmt *stmt)
 				(errcode(ERRCODE_RAISE_EXCEPTION),
 				 errmsg("pg_savior: ALTER TABLE %s on a large table (%.0f rows) is blocked",
 						op, reltuples),
-				 errhint("This operation rewrites the whole table. "
-						 "Plan a batched migration; raise pg_savior.large_table_threshold_rows; "
+				 errhint("This operation can rewrite or scan the whole table while holding a strong lock. "
+						 "Plan a safer migration; raise pg_savior.large_table_threshold_rows; "
 						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
 	}
 }
@@ -275,19 +396,22 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 						 QueryCompletion *qc)
 {
 	Node *parsetree = pstmt->utilityStmt;
+	bool index_parent = IsA(parsetree, CreateStmt)
+		|| IsA(parsetree, AlterTableStmt);
 
 	if (pg_savior_enabled && !pg_savior_bypass)
 	{
 		/*
-		 * CREATE TABLE constraints generate constraint IndexStmt subcommands;
-		 * LIKE INCLUDING INDEXES generates transformed ones. Both build indexes
-		 * on a new empty table. Explicit CREATE INDEX commands nested in CREATE
-		 * SCHEMA are also subcommands, but have neither marker and remain guarded.
+		 * CREATE TABLE constraints and LIKE INCLUDING INDEXES generate IndexStmt
+		 * subcommands. ALTER TABLE can do the same after its size check passes.
+		 * Track those outer statements so explicit CREATE INDEX nested in CREATE
+		 * SCHEMA cannot masquerade as an internal generated index.
 		 */
 		if (IsA(parsetree, IndexStmt))
 		{
 			IndexStmt *stmt = (IndexStmt *) parsetree;
-			bool generated = context == PROCESS_UTILITY_SUBCOMMAND
+			bool generated = pg_savior_index_parent_depth > 0
+				&& context == PROCESS_UTILITY_SUBCOMMAND
 				&& (stmt->isconstraint || stmt->transformed);
 
 			if (!generated)
@@ -303,12 +427,24 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 			pg_savior_check_truncate((TruncateStmt *) parsetree);
 	}
 
-	if (prev_ProcessUtility_hook)
-		prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
-								 params, queryEnv, dest, qc);
-	else
-		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-								params, queryEnv, dest, qc);
+	if (index_parent)
+		pg_savior_index_parent_depth++;
+
+	PG_TRY();
+	{
+		if (prev_ProcessUtility_hook)
+			prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+									 params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		if (index_parent)
+			pg_savior_index_parent_depth--;
+	}
+	PG_END_TRY();
 }
 
 void
