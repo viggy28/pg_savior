@@ -104,7 +104,7 @@ DELETE 1
 | GUC | Default | Scope | Effect |
 |---|---|---|---|
 | `pg_savior.enabled` | `on` | session (`USERSET`) | Master switch. When `off`, no checks run. |
-| `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, the current session's `DELETE`/`UPDATE` are allowed through unconditionally. Use to do an intentional bulk operation. |
+| `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, all pg_savior guards are bypassed for the current session. Use for an intentional operation that would otherwise be blocked. |
 | `pg_savior.max_rows_affected` | `0` (disabled) | session (`USERSET`) | When > 0, refuse `DELETE`/`UPDATE` whose planner row estimate exceeds this. Catches destructive queries that *do* have a `WHERE` but match too much (e.g. `DELETE FROM emp WHERE id > 0`). |
 | `pg_savior.large_table_threshold_rows` | `1000000` | session (`USERSET`) | Tables with `pg_class.reltuples` greater than this are considered "large" for the DDL guards (currently: `ALTER TABLE ADD COLUMN ... DEFAULT`). Raise it for permissive environments, lower it for stricter ones. |
 
