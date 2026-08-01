@@ -2,10 +2,24 @@
 #include <postgres.h>
 #include <fmgr.h>
 // clang-format on
+#include "access/genam.h"
 #include "access/relation.h"
+#include "access/table.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_type_d.h"
+#include "commands/tablecmds.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
@@ -13,13 +27,22 @@
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_node.h"
 #include "parser/parse_type.h"
+#include "parser/parse_utilcmd.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/typcache.h"
 
 PG_MODULE_MAGIC;
@@ -346,6 +369,184 @@ column_has_index_constraint(ColumnDef *col)
 	return false;
 }
 
+/*
+ * This is PostgreSQL's ATColumnChangeRequiresRewrite(), expressed using only
+ * exported node types and helpers.  Keep it in sync with supported server
+ * branches: PostgreSQL 14 through 17 have the same decision tree.
+ */
+static bool
+pg_savior_column_change_requires_rewrite(Node *expr, AttrNumber varattno)
+{
+	Assert(expr != NULL);
+
+	for (;;)
+	{
+		if (IsA(expr, Var) && ((Var *) expr)->varattno == varattno)
+			return false;
+		if (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+		else if (IsA(expr, CoerceToDomain))
+		{
+			CoerceToDomain *domain = (CoerceToDomain *) expr;
+
+			if (DomainHasConstraints(domain->resulttype))
+				return true;
+			expr = (Node *) domain->arg;
+		}
+		else if (IsA(expr, FuncExpr))
+		{
+			FuncExpr *func = (FuncExpr *) expr;
+
+			if (func->funcid != F_TIMESTAMPTZ_TIMESTAMP
+				&& func->funcid != F_TIMESTAMP_TIMESTAMPTZ)
+				return true;
+			if (TimestampTimestampTzRequiresRewrite())
+				return true;
+			expr = (Node *) linitial(func->args);
+		}
+		else
+			return true;
+	}
+}
+
+/*
+ * Transform a single ALTER TYPE command against rel without touching the
+ * caller's utility tree, then reproduce ATPrepAlterColumnType's coercion and
+ * planning steps.  Parse/coercion failures intentionally use core routines so
+ * an invalid ALTER retains PostgreSQL's normal error rather than our guard.
+ */
+static bool
+pg_savior_alter_type_requires_rewrite(Relation rel, AlterTableStmt *stmt,
+									  AlterTableCmd *cmd,
+									  const char *queryString)
+{
+	ColumnDef *rawdef = (ColumnDef *) cmd->def;
+	ColumnDef *def = rawdef;
+	AlterTableCmd *transformed_cmd = NULL;
+	HeapTuple tuple;
+	Form_pg_attribute attr;
+	AttrNumber attnum;
+	Oid targettype;
+	int32 targettypmod;
+	Oid targetcollid;
+	Node *transform;
+	ParseState *pstate;
+	AclResult aclresult;
+	bool is_expr;
+	bool attrgenerated;
+
+	/* transformAlterTableStmt is allowed to scribble, so give it a private tree. */
+	if (rawdef->raw_default != NULL)
+	{
+		AlterTableStmt *one = copyObject(stmt);
+		List *before = NIL;
+		List *after = NIL;
+		ListCell *lc;
+
+		one->cmds = list_make1(copyObject(cmd));
+		one = transformAlterTableStmt(RelationGetRelid(rel), one, queryString,
+									  &before, &after);
+		foreach (lc, one->cmds)
+		{
+			AlterTableCmd *candidate = (AlterTableCmd *) lfirst(lc);
+
+			if (candidate->subtype == AT_AlterColumnType)
+			{
+				transformed_cmd = candidate;
+				break;
+			}
+		}
+		Assert(transformed_cmd != NULL);
+		def = (ColumnDef *) transformed_cmd->def;
+	}
+
+	if (rel->rd_rel->reloftype)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot alter column type of typed table")));
+
+	tuple = SearchSysCacheAttName(RelationGetRelid(rel), cmd->name);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						cmd->name, RelationGetRelationName(rel))));
+	attr = (Form_pg_attribute) GETSTRUCT(tuple);
+	attnum = attr->attnum;
+	if (attnum <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot alter system column \"%s\"", cmd->name)));
+	if (attr->attgenerated && def->cooked_default != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
+				 errmsg("cannot specify USING when altering type of generated column"),
+				 errdetail("Column \"%s\" is a generated column.", cmd->name)));
+	if (attr->attinhcount > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot alter inherited column \"%s\"", cmd->name)));
+	if (has_partition_attrs(rel,
+						bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+						&is_expr))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot alter column \"%s\" because it is part of the partition key of relation \"%s\"",
+						cmd->name, RelationGetRelationName(rel))));
+
+	typenameTypeIdAndMod(NULL, def->typeName, &targettype, &targettypmod);
+#if PG_VERSION_NUM >= 160000
+	aclresult = object_aclcheck(TypeRelationId, targettype, GetUserId(), ACL_USAGE);
+#else
+	aclresult = pg_type_aclcheck(targettype, GetUserId(), ACL_USAGE);
+#endif
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error_type(aclresult, targettype);
+	targetcollid = GetColumnDefCollation(NULL, def, targettype);
+	CheckAttributeType(cmd->name, targettype, targetcollid,
+				   list_make1_oid(rel->rd_rel->reltype), 0);
+
+	attrgenerated = attr->attgenerated != '\0';
+	transform = def->cooked_default != NULL
+		? copyObject(def->cooked_default) : NULL;
+	if (transform == NULL)
+		transform = (Node *) makeVar(1, attnum, attr->atttypid,
+									 attr->atttypmod, attr->attcollation, 0);
+	ReleaseSysCache(tuple);
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+	transform = coerce_to_target_type(pstate, transform, exprType(transform),
+									 targettype, targettypmod,
+									 COERCION_ASSIGNMENT,
+									 COERCE_IMPLICIT_CAST, -1);
+	if (transform == NULL)
+	{
+		if (def->cooked_default != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("result of USING clause for column \"%s\" cannot be cast automatically to type %s",
+							cmd->name, format_type_be(targettype)),
+					 errhint("You might need to add an explicit cast.")));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("column \"%s\" cannot be cast automatically to type %s",
+							cmd->name, format_type_be(targettype)),
+					 !attrgenerated
+					 ? errhint("You might need to specify \"USING %s::%s\".",
+							   quote_identifier(cmd->name),
+							   format_type_with_typemod(targettype, targettypmod))
+					 : 0));
+	}
+
+	assign_expr_collations(pstate, transform);
+	transform = (Node *) expression_planner((Expr *) transform);
+	free_parsestate(pstate);
+
+	return pg_savior_column_change_requires_rewrite(transform, attnum);
+}
+
 static const char *
 pg_savior_alter_table_op(AlterTableCmd *cmd, const char *queryString)
 {
@@ -362,9 +563,6 @@ pg_savior_alter_table_op(AlterTableCmd *cmd, const char *queryString)
 				return "ADD COLUMN with index-backed CONSTRAINT";
 			return NULL;
 		}
-
-		case AT_AlterColumnType:
-			return "ALTER COLUMN TYPE";
 
 		case AT_AddConstraint:
 		{
@@ -421,26 +619,332 @@ alter_statement_drops_column(AlterTableStmt *stmt, const char *name)
 	return false;
 }
 
+/*
+ * Core rejects a second ALTER TYPE after the first command changes the
+ * column's type or typmod, before phase 3 can rewrite the heap.  Let core
+ * report that error instead of replacing it with a pg_savior policy error.
+ */
+static bool
+alter_type_has_core_duplicate_error(Relation rel, AlterTableStmt *stmt)
+{
+	List	   *changed_columns = NIL;
+	ListCell   *lc;
+
+	foreach (lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+		ColumnDef  *def;
+		AttrNumber	attnum;
+		Form_pg_attribute attr;
+		Oid			targettype;
+		int32		targettypmod;
+
+		if (cmd->subtype != AT_AlterColumnType)
+			continue;
+		if (string_list_contains(changed_columns, cmd->name))
+			return true;
+
+		attnum = get_attnum(RelationGetRelid(rel), cmd->name);
+		if (attnum == InvalidAttrNumber || attnum <= 0)
+			continue;
+		def = (ColumnDef *) cmd->def;
+		typenameTypeIdAndMod(NULL, def->typeName, &targettype, &targettypmod);
+		attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+		if (targettype != attr->atttypid || targettypmod != attr->atttypmod)
+			changed_columns = lappend(changed_columns, cmd->name);
+	}
+
+	return false;
+}
+
+/* GetAttrDefaultOid() is not exported on every supported server branch. */
+static Oid
+pg_savior_attr_default_oid(Oid relid, AttrNumber attnum)
+{
+	Relation	attrdefRel;
+	SysScanDesc scan;
+	ScanKeyData key[2];
+	HeapTuple	tuple;
+	Oid			result = InvalidOid;
+
+	attrdefRel = table_open(AttrDefaultRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_attrdef_adrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	ScanKeyInit(&key[1],
+				Anum_pg_attrdef_adnum,
+				BTEqualStrategyNumber, F_INT2EQ,
+				Int16GetDatum(attnum));
+	scan = systable_beginscan(attrdefRel, AttrDefaultIndexId, true,
+							 NULL, 2, key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+		result = ((Form_pg_attrdef) GETSTRUCT(tuple))->oid;
+	systable_endscan(scan);
+	table_close(attrdefRel, AccessShareLock);
+	return result;
+}
+
+/*
+ * Return true when core will reject a dependency before phase 3.  Indexes,
+ * constraints, the column's own default, and extended statistics are rebuilt;
+ * other direct dependencies (views, functions, triggers, policies, generated
+ * columns, publication expressions, and unexpected relation kinds) are fatal.
+ */
+static bool
+alter_type_has_blocking_dependency(Oid relid, AttrNumber attnum)
+{
+	Relation	depRel;
+	SysScanDesc scan;
+	ScanKeyData key[3];
+	HeapTuple	depTup;
+	Oid			own_default = pg_savior_attr_default_oid(relid, attnum);
+	bool		blocking = false;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	ScanKeyInit(&key[2],
+				Anum_pg_depend_refobjsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) attnum));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							 NULL, 3, key);
+
+	while (HeapTupleIsValid(depTup = systable_getnext(scan)))
+	{
+		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(depTup);
+
+		if (dep->classid == RelationRelationId)
+		{
+			char relkind = get_rel_relkind(dep->objid);
+
+			if (relkind == RELKIND_INDEX
+				|| relkind == RELKIND_PARTITIONED_INDEX
+				|| relkind == RELKIND_SEQUENCE)
+				continue;
+		}
+		else if (dep->classid == ConstraintRelationId
+				 || dep->classid == StatisticExtRelationId)
+			continue;
+		else if (dep->classid == AttrDefaultRelationId
+				 && dep->objid == own_default)
+			continue;
+
+		blocking = true;
+		break;
+	}
+
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return blocking;
+}
+
+/*
+ * Detect validations that make core fail before a possible heap rewrite.  In
+ * those cases pg_savior stands aside so PostgreSQL keeps its specific error.
+ */
+static bool
+alter_type_core_will_reject(Relation rel, AlterTableCmd *cmd)
+{
+	AttrNumber	attnum;
+	Form_pg_attribute attr;
+	ColumnDef  *def = (ColumnDef *) cmd->def;
+	Oid			targettype;
+	int32		targettypmod;
+	Node	   *defaultexpr;
+
+	attnum = get_attnum(RelationGetRelid(rel), cmd->name);
+	if (attnum == InvalidAttrNumber || attnum <= 0)
+		return false;
+	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	typenameTypeIdAndMod(NULL, def->typeName, &targettype, &targettypmod);
+
+	if (attr->attidentity != '\0'
+		&& targettype != INT2OID
+		&& targettype != INT4OID
+		&& targettype != INT8OID)
+		return true;
+
+	if (attr->atthasdef)
+	{
+		defaultexpr = build_column_default(rel, attnum);
+		if (defaultexpr != NULL)
+		{
+			defaultexpr = strip_implicit_coercions(defaultexpr);
+			defaultexpr = coerce_to_target_type(NULL,
+										 defaultexpr, exprType(defaultexpr),
+										 targettype, targettypmod,
+										 COERCION_ASSIGNMENT,
+										 COERCE_IMPLICIT_CAST, -1);
+			if (defaultexpr == NULL)
+				return true;
+		}
+	}
+
+	return alter_type_has_blocking_dependency(RelationGetRelid(rel), attnum);
+}
+
 static void
 pg_savior_check_alter_table(AlterTableStmt *stmt, const char *queryString)
 {
 	Relation	rel;
 	Oid			relid;
+	LOCKMODE	lockmode;
+	LOCKMODE	close_lockmode;
 	double		reltuples;
 	List	   *added_columns = NIL;
+	List	   *descendants = NIL;
 	ListCell   *lc;
+	ListCell   *cmd_lc;
+	bool		has_alter_type = false;
+	double		large_physical_rows = -1;
 
-	/* Preserve ALTER TABLE IF EXISTS no-op behavior before cooking defaults. */
-	rel = relation_openrv_extended(stmt->relation, AccessShareLock, true);
-	if (rel == NULL)
-		return;
+	foreach (lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
 
-	relid = RelationGetRelid(rel);
+		if (cmd->subtype == AT_AlterColumnType)
+			has_alter_type = true;
+	}
+
+	/* ALTER TYPE needs core's lock level; preserve lighter existing guards. */
+	if (has_alter_type)
+	{
+		lockmode = AlterTableGetLockLevel(stmt->cmds);
+		relid = AlterTableLookupRelation(stmt, lockmode);
+		if (!OidIsValid(relid))
+			return;
+		rel = relation_open(relid, NoLock);
+		close_lockmode = NoLock;
+	}
+	else
+	{
+		lockmode = AccessShareLock;
+		rel = relation_openrv_extended(stmt->relation, lockmode, true);
+		if (rel == NULL)
+			return;
+		relid = RelationGetRelid(rel);
+		close_lockmode = lockmode;
+	}
 	reltuples = rel->rd_rel->reltuples;
+
+	/* Let core report statements that cannot reach a heap rewrite. */
+	if (has_alter_type
+		&& ((!stmt->relation->inh
+			 && find_inheritance_children(relid, NoLock) != NIL)
+			|| alter_type_has_core_duplicate_error(rel, stmt)))
+	{
+		relation_close(rel, close_lockmode);
+		return;
+	}
+
+	/* Core rejects USING on relation kinds for which it cannot transform rows. */
+	if (has_alter_type
+		&& rel->rd_rel->relkind != RELKIND_RELATION
+		&& rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		foreach (lc, stmt->cmds)
+		{
+			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+			ColumnDef  *def = cmd->subtype == AT_AlterColumnType
+				? (ColumnDef *) cmd->def : NULL;
+
+			if (def != NULL
+				&& (def->raw_default != NULL || def->cooked_default != NULL))
+			{
+				relation_close(rel, close_lockmode);
+				return;
+			}
+		}
+	}
+
+	/*
+	 * ALTER TYPE recurses through inheritance and partitions.  Inspect every
+	 * physical target so a storage-less or small parent cannot conceal a large
+	 * child.  Child locks are released immediately: core locks identity
+	 * sequences before descendants, so retaining child locks would invert its
+	 * lock order.  The root's AccessExclusiveLock stabilizes membership.
+	 */
+	if (has_alter_type)
+	{
+		if (stmt->relation->inh)
+			descendants = find_all_inheritors(relid, NoLock, NULL);
+		else
+			descendants = list_make1_oid(relid);
+
+		foreach (lc, descendants)
+		{
+			Oid targetid = lfirst_oid(lc);
+			Relation target;
+			bool close_target;
+
+			if (targetid == relid)
+			{
+				target = rel;
+				close_target = false;
+			}
+			else
+			{
+				target = relation_open(targetid, AccessShareLock);
+				close_target = true;
+			}
+
+			foreach (cmd_lc, stmt->cmds)
+			{
+				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(cmd_lc);
+
+				if (cmd->subtype == AT_AlterColumnType
+					&& alter_type_core_will_reject(target, cmd))
+				{
+					if (close_target)
+						relation_close(target, AccessShareLock);
+					relation_close(rel, close_lockmode);
+					return;
+				}
+			}
+
+			if (target->rd_rel->relkind == RELKIND_RELATION
+				&& target->rd_rel->reltuples >= 0
+				&& target->rd_rel->reltuples > pg_savior_large_table_threshold_rows)
+				large_physical_rows = target->rd_rel->reltuples;
+
+			if (close_target)
+				relation_close(target, AccessShareLock);
+		}
+
+		if (large_physical_rows >= 0)
+		{
+			foreach (lc, stmt->cmds)
+			{
+				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+				if (cmd->subtype == AT_AlterColumnType
+					&& pg_savior_alter_type_requires_rewrite(rel, stmt, cmd,
+													queryString))
+					ereport(ERROR,
+							(errcode(ERRCODE_RAISE_EXCEPTION),
+							 errmsg("pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (%.0f rows) is blocked",
+									large_physical_rows),
+							 errhint("This operation can rewrite or scan the whole table while holding a strong lock. "
+									 "Plan a safer migration; raise pg_savior.large_table_threshold_rows; "
+									 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
+			}
+		}
+	}
+
+	/* Existing non-ALTER-TYPE guards continue to use the root's estimate. */
 	if (reltuples < 0
 		|| reltuples <= pg_savior_large_table_threshold_rows)
 	{
-		relation_close(rel, AccessShareLock);
+		relation_close(rel, close_lockmode);
 		return;
 	}
 
@@ -472,7 +976,7 @@ pg_savior_check_alter_table(AlterTableStmt *stmt, const char *queryString)
 						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
 	}
 
-	relation_close(rel, AccessShareLock);
+	relation_close(rel, close_lockmode);
 }
 
 static void

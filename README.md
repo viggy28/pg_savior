@@ -19,7 +19,7 @@ Pre-1.0: APIs, configuration, and policy defaults may change between releases. T
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [x] Block `CREATE INDEX` without `CONCURRENTLY`
 - [x] Block rewrite-causing `ALTER TABLE ADD COLUMN` operations on large tables
-- [x] Block `ALTER TABLE ALTER COLUMN TYPE` on large tables
+- [x] Block heap-rewriting `ALTER TABLE ALTER COLUMN TYPE` operations on large tables
 - [x] Block `TRUNCATE` on large tables
 - [x] Block `DROP TABLE` on large tables
 - [x] Block `DROP DATABASE`
@@ -157,6 +157,12 @@ ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (5000000 rows)
 HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 ```
 
+The ALTER COLUMN TYPE guard follows PostgreSQL 14–17's heap-rewrite decision rather than maintaining a list of type pairs. pg_savior transforms a private copy of an explicit `USING` expression against the original relation, applies PostgreSQL's assignment coercion and collation processing, plans the expression, and then uses the same allowed shapes as core: the original column `Var`, optionally wrapped in binary-compatible `RelabelType` nodes, unconstrained `CoerceToDomain` nodes, or timestamp/timestamptz conversion functions when the session time zone is UTC-safe. Type-specific typmod changes that PostgreSQL plans without a rewrite (for example, widening `varchar`) and binary-compatible changes therefore pass; rewrite-causing typmod changes, integer widening, constrained domains, arbitrary `USING` calculations, and timestamp/timestamptz changes in a time zone where core requires conversion are blocked on large physical tables. An explicit identity `USING column_name` is allowed when its planned expression has one of the no-rewrite shapes.
+
+For recursive ALTERs, each physical inheritance child and partition is checked while the root is held at the ALTER's lock level; descendant inspection uses short-lived share locks so PostgreSQL's identity-sequence lock order is preserved. A small or storage-less parent cannot hide a large descendant. `ALTER TABLE ONLY` does not inspect descendants, and storage-less partitioned parents do not contribute a row estimate themselves.
+
+“No heap rewrite” only describes the table heap. PostgreSQL can still rebuild or revalidate dependent indexes and constraints while changing catalog types, so an allowed ALTER may still perform significant auxiliary work and hold an `ACCESS EXCLUSIVE` lock. pg_savior leaves PostgreSQL's dependency checks and errors in force.
+
 The ADD COLUMN guard follows PostgreSQL's fast-default rules. Immutable constants and expressions, plus `STABLE` functions such as `now()`, are evaluated once and stored as a missing value without rewriting existing rows, so pg_savior allows them. `VOLATILE` expressions such as `random()`, `nextval()`, and volatile user-defined functions require per-row evaluation and are blocked on large tables. Defaults and implicit values that require rewrites—constrained domains, serial/identity columns, and stored generated columns—are blocked as well.
 
 Volatility comes from PostgreSQL's function catalog metadata. User-defined functions must be labeled correctly (`IMMUTABLE`, `STABLE`, or `VOLATILE`) for PostgreSQL and pg_savior to classify them correctly.
@@ -177,6 +183,7 @@ Each test file uses `LOAD 'pg_savior'` so the framework works whether or not `pg
 
 The safety-matrix suites pair dangerous and safe forms and verify database state after every rejection:
 
+- `alter_type_rewrite` — planned ALTER TYPE shapes, heap filenodes, inheritance/partitions, dependencies, thresholds, and controls
 - `safety_dml_shapes` — CTEs, subqueries, prepared statements, parameters, `RETURNING`, and estimate thresholds
 - `safety_relation_types` — views, partitioned tables, and inherited tables
 - `safety_ddl_edges` — multi-target DDL, index no-ops, generated indexes, constraints, and threshold boundaries
@@ -239,7 +246,7 @@ pg_savior installs three hooks:
    - `ALTER TABLE ADD COLUMN` when the default is volatile or the new column otherwise requires a per-row rewrite (constrained domain, serial/identity, or stored generated column) and the target table is over the threshold
    - `ALTER TABLE ADD` a newly built index-backed constraint, including column-level `UNIQUE`/`PRIMARY KEY`, when the target table is over the threshold; attaching an existing unique index is allowed, while `PRIMARY KEY ... USING INDEX` remains guarded because it may scan to enforce `NOT NULL`
    - `ALTER TABLE ADD` a validated `CHECK`/foreign-key constraint when the target table is over the threshold (`NOT VALID` is allowed)
-   - `ALTER TABLE ALTER COLUMN TYPE` when the target table is over the threshold (conservative: some binary-compatible casts do not rewrite)
+   - `ALTER TABLE ALTER COLUMN TYPE` when PostgreSQL's planned conversion expression requires a heap rewrite and any affected physical inheritance/partition relation is over the threshold; binary-compatible changes, widening typmods, unconstrained domains, identity `USING`, and UTC-safe timestamp/timestamptz conversions are allowed when core does not rewrite
    - `TRUNCATE` when any target table is over the threshold (multi-table truncates blocked if *any* target is large)
    - `DROP TABLE` when any target table is over the threshold (multi-table drops blocked if *any* target is large)
    - `DROP DATABASE` (always)
