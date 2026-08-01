@@ -7,6 +7,8 @@
 # Usage:
 #   docker/test.sh                       # default PG version (16)
 #   PG_MAJOR=15 docker/test.sh           # test against another PG version
+#   TEST_ARTIFACT_DIR=artifacts docker/test.sh
+#                                        # save failure diagnostics to artifacts/
 #   docker/test.sh --capture-expected    # copy results/*.out from container
 #                                        # back to host expected/ (use once
 #                                        # to seed expected outputs)
@@ -18,6 +20,7 @@ SRC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PG_MAJOR="${PG_MAJOR:-16}"
 IMAGE="pg-savior-test:pg${PG_MAJOR}"
 CONTAINER="pg-savior-test-pg${PG_MAJOR}"
+TEST_ARTIFACT_DIR="${TEST_ARTIFACT_DIR:-}"
 
 CAPTURE_EXPECTED=0
 for arg in "$@"; do
@@ -27,8 +30,47 @@ for arg in "$@"; do
   esac
 done
 
+# These functions are reached through the EXIT trap call chain.
+# shellcheck disable=SC2329
 cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+
+# shellcheck disable=SC2329
+collect_failure_diagnostics() {
+  [ -n "$TEST_ARTIFACT_DIR" ] || return 0
+
+  echo "==> Saving failure diagnostics to $TEST_ARTIFACT_DIR"
+  mkdir -p "$TEST_ARTIFACT_DIR"
+  {
+    echo "PG_MAJOR=$PG_MAJOR"
+    echo "IMAGE=$IMAGE"
+    docker version 2>&1 || true
+  } >"$TEST_ARTIFACT_DIR/environment.txt"
+
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    docker logs "$CONTAINER" >"$TEST_ARTIFACT_DIR/postgres.log" 2>&1 || true
+    docker inspect "$CONTAINER" >"$TEST_ARTIFACT_DIR/container-inspect.json" 2>&1 || true
+    docker cp "$CONTAINER":/pg_savior/regression.diffs \
+      "$TEST_ARTIFACT_DIR/regression.diffs" >/dev/null 2>&1 || true
+    docker cp "$CONTAINER":/pg_savior/regression.out \
+      "$TEST_ARTIFACT_DIR/regression.out" >/dev/null 2>&1 || true
+    docker cp "$CONTAINER":/pg_savior/results \
+      "$TEST_ARTIFACT_DIR/results" >/dev/null 2>&1 || true
+  else
+    echo "Container $CONTAINER was not created; see the job log for build output." \
+      >"$TEST_ARTIFACT_DIR/no-container.txt"
+  fi
+}
+
+# shellcheck disable=SC2329
+on_exit() {
+  local result="$?"
+  if [ "$result" -ne 0 ]; then
+    collect_failure_diagnostics
+  fi
+  cleanup
+  exit "$result"
+}
+trap on_exit EXIT
 
 echo "==> Building image $IMAGE"
 docker build \
