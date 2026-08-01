@@ -1,0 +1,66 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+
+CREATE TABLE index_parent (id int) PARTITION BY RANGE (id);
+CREATE TABLE index_leaf_low PARTITION OF index_parent
+  FOR VALUES FROM (0) TO (100);
+CREATE TABLE index_branch PARTITION OF index_parent
+  FOR VALUES FROM (100) TO (200) PARTITION BY RANGE (id);
+CREATE TABLE index_leaf_high PARTITION OF index_branch
+  FOR VALUES FROM (100) TO (200);
+
+-- Recursive parent builds cannot use CONCURRENTLY and remain blocked. The
+-- CREATE INDEX guard is intentionally independent of the DDL row threshold.
+SET pg_savior.large_table_threshold_rows = 0;
+CREATE INDEX blocked_parent_idx ON index_parent (id);
+SELECT to_regclass('blocked_parent_idx') IS NULL AS zero_threshold_blocked;
+
+SET pg_savior.large_table_threshold_rows = 2147483647;
+CREATE INDEX blocked_parent_idx ON index_parent (id);
+SELECT to_regclass('blocked_parent_idx') IS NULL AS high_threshold_blocked;
+
+-- ONLY is safe only for a partitioned parent. It creates metadata without
+-- scanning the leaves; an ordinary table still requires CONCURRENTLY.
+CREATE TABLE index_ordinary (id int);
+CREATE INDEX blocked_ordinary_idx ON ONLY index_ordinary (id);
+SELECT to_regclass('blocked_ordinary_idx') IS NULL AS ordinary_only_blocked;
+
+-- PostgreSQL's supported online workflow also works for multi-level trees:
+-- create metadata-only parent indexes, build leaves concurrently, and attach.
+CREATE INDEX safe_parent_idx ON ONLY index_parent (id);
+CREATE INDEX safe_branch_idx ON ONLY index_branch (id);
+SELECT indisvalid AS parent_valid_before_attach
+FROM pg_index WHERE indexrelid = 'safe_parent_idx'::regclass;
+
+CREATE INDEX CONCURRENTLY safe_low_idx ON index_leaf_low (id);
+CREATE INDEX CONCURRENTLY safe_high_idx ON index_leaf_high (id);
+ALTER INDEX safe_branch_idx ATTACH PARTITION safe_high_idx;
+ALTER INDEX safe_parent_idx ATTACH PARTITION safe_low_idx;
+ALTER INDEX safe_parent_idx ATTACH PARTITION safe_branch_idx;
+
+SELECT bool_and(indisvalid) AS attached_tree_valid
+FROM pg_index
+WHERE indexrelid IN ('safe_parent_idx'::regclass,
+                     'safe_branch_idx'::regclass,
+                     'safe_low_idx'::regclass,
+                     'safe_high_idx'::regclass);
+
+-- A non-concurrent build directly on a leaf remains blocked.
+CREATE INDEX blocked_leaf_idx ON index_leaf_low (id);
+SELECT to_regclass('blocked_leaf_idx') IS NULL AS leaf_nonconcurrent_blocked;
+
+-- Session overrides retain their existing precedence for recursive builds.
+SET pg_savior.bypass = on;
+CREATE INDEX bypass_parent_idx ON index_parent (id);
+SELECT to_regclass('bypass_parent_idx') IS NOT NULL AS bypass_recursive_allowed;
+DROP INDEX bypass_parent_idx;
+RESET pg_savior.bypass;
+
+SET pg_savior.enabled = off;
+CREATE INDEX disabled_parent_idx ON index_parent (id);
+SELECT to_regclass('disabled_parent_idx') IS NOT NULL AS disabled_recursive_allowed;
+DROP INDEX disabled_parent_idx;
+SET pg_savior.enabled = on;
+
+DROP TABLE index_parent;
+DROP TABLE index_ordinary;

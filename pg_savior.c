@@ -187,14 +187,16 @@ pg_savior_relation_tuples(RangeVar *relation)
 static void
 pg_savior_check_create_index(IndexStmt *stmt)
 {
+	Relation rel;
+	bool	 partitioned;
+
 	if (stmt->concurrent)
 		return;
 
 	/* An existing same-schema relation makes IF NOT EXISTS a harmless no-op. */
 	if (stmt->if_not_exists && stmt->idxname != NULL)
 	{
-		Relation rel = relation_openrv_extended(stmt->relation,
-										ShareLock, true);
+		rel = relation_openrv_extended(stmt->relation, ShareLock, true);
 
 		if (rel != NULL)
 		{
@@ -213,6 +215,45 @@ pg_savior_check_create_index(IndexStmt *stmt)
 				UnlockRelationOid(existing, ShareLock);
 			}
 			relation_close(rel, ShareLock);
+		}
+	}
+
+	/*
+	 * PostgreSQL cannot build an index concurrently on a partitioned parent.
+	 * Its documented online migration creates an invalid metadata-only parent
+	 * index with ON ONLY, builds each leaf concurrently, then attaches them.
+	 * Allow only that proven metadata-only parent operation.
+	 */
+	if (!stmt->relation->inh)
+	{
+		rel = relation_openrv_extended(stmt->relation, ShareLock, true);
+		if (rel != NULL)
+		{
+			partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
+			if (partitioned)
+			{
+				/* Keep the target stable until core processes the allowed command. */
+				relation_close(rel, NoLock);
+				return;
+			}
+			relation_close(rel, ShareLock);
+		}
+	}
+	else
+	{
+		/* Inspect only to provide an actionable partition-specific error. */
+		rel = relation_openrv_extended(stmt->relation, AccessShareLock, true);
+		if (rel != NULL)
+		{
+			partitioned = rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE;
+			relation_close(rel, AccessShareLock);
+			if (partitioned)
+				ereport(ERROR,
+						(errcode(ERRCODE_RAISE_EXCEPTION),
+						 errmsg("pg_savior: recursive CREATE INDEX on a partitioned table is blocked"),
+						 errhint("Create the parent index with CREATE INDEX ON ONLY, build each leaf "
+								 "index with CREATE INDEX CONCURRENTLY, then attach them with ALTER "
+								 "INDEX ... ATTACH PARTITION; or set pg_savior.bypass = on.")));
 		}
 	}
 
