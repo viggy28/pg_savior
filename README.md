@@ -1,6 +1,6 @@
 # pg_savior
 
-pg_savior is a PostgreSQL extension that prevents accidental data loss from `DELETE` and `UPDATE` statements that have no `WHERE` clause. It hooks the parser, raises an `ERROR` on unguarded statements, and aborts the transaction so the application notices.
+pg_savior is a PostgreSQL extension that prevents accidental data loss and risky blocking schema changes. It inspects supported DML and DDL statements, raises an `ERROR` when a configured safety policy is violated, and aborts the transaction so the application notices.
 
 ![pg_savior catching a DELETE without WHERE and a DROP TABLE on a large table](./demo.gif)
 
@@ -27,6 +27,32 @@ Pre-1.0: APIs, configuration, and policy defaults may change between releases. T
 - [x] Session-level on/off GUC (`pg_savior.enabled`)
 - [ ] Per-table opt-out via reloptions
 - [x] Volatility-aware `ADD COLUMN DEFAULT` detection
+
+## Statement coverage
+
+“Covered” means pg_savior inspects the statement and applies the policy described below; it does **not** mean every form is blocked. Safe forms, no-ops, operations below configured thresholds, and statements executed with bypass or protection disabled are allowed.
+
+| Statement or family | Coverage | Current policy |
+|---|---|---|
+| `DELETE` | **Covered** | Blocks a statement without a `WHERE` clause. With `pg_savior.max_rows_affected > 0`, also blocks a qualified delete whose planner estimate exceeds the limit. Includes data-modifying CTEs. |
+| `UPDATE` | **Covered** | Blocks a statement without a `WHERE` clause. With `pg_savior.max_rows_affected > 0`, also blocks a qualified update whose planner estimate exceeds the limit. Includes data-modifying CTEs. |
+| `CREATE INDEX` / `CREATE UNIQUE INDEX` | **Covered** | Blocks non-concurrent builds. Allows `CONCURRENTLY`, harmless `IF NOT EXISTS` no-ops, and metadata-only `ON ONLY` indexes on partitioned parents. Partition leaf indexes must be built concurrently. |
+| `ALTER TABLE ... ADD COLUMN` | **Partially covered** | On a large target, blocks volatile defaults and other additions known to rewrite existing rows, including constrained domains, serial/identity columns, and stored generated columns. Fast defaults and plain additions without rewrite work are allowed; column-level `UNIQUE`/`PRIMARY KEY` remains covered by the index-backed constraint policy. |
+| `ALTER TABLE ... ADD CONSTRAINT` | **Partially covered** | On a large target, blocks newly built index-backed constraints and validated `CHECK`/foreign-key constraints. Allows attaching an existing unique index and adding `CHECK`/foreign-key constraints with `NOT VALID`; `PRIMARY KEY ... USING INDEX` remains guarded because it can scan for `NOT NULL`. |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | **Covered for heap rewrites** | Blocks conversions that PostgreSQL plans as heap rewrites when any affected physical inheritance or partition relation is large. Proven no-heap-rewrite conversions are allowed, although PostgreSQL may still rebuild dependent indexes or constraints. |
+| `ALTER INDEX ... ATTACH PARTITION` | **Supported safe workflow** | Allowed so concurrently built leaf indexes can be attached to metadata-only partitioned parent indexes. |
+| Other `ALTER TABLE` / `ALTER INDEX` subcommands | **Not covered** | No dedicated guard for operations such as `DROP COLUMN`, `SET NOT NULL`, `SET`/`DROP DEFAULT`, `SET TABLESPACE`, `SET ACCESS METHOD`, trigger changes, or most partition attach/detach operations. |
+| `TRUNCATE` | **Partially covered** | Blocks explicitly named targets whose `reltuples` estimate exceeds the large-table threshold. Relations reached only through `CASCADE` are not independently checked. |
+| `DROP TABLE` | **Partially covered** | Blocks explicitly named large tables. Objects removed only as dependencies of `CASCADE` are not independently checked. |
+| `DROP DATABASE` | **Covered** | Always blocked while protection is enabled, regardless of size. |
+| Other `DROP` statements | **Not covered** | No dedicated guard for `DROP SCHEMA`, `DROP OWNED`, `DROP INDEX`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP SEQUENCE`, `DROP TYPE`, `DROP ROLE`, `DROP TABLESPACE`, or `DROP EXTENSION`. |
+| `INSERT`, `COPY FROM`, `MERGE` | **Not covered** | Row creation and mixed-action `MERGE` statements are not inspected. |
+| `CREATE TABLE AS`, `SELECT INTO` | **Not covered** | Statements that materialize query results into a new relation are not inspected. |
+| `VACUUM FULL`, `CLUSTER`, `REINDEX`, `REFRESH MATERIALIZED VIEW` | **Not covered** | Rewrite- or lock-heavy maintenance commands have no dedicated guard. |
+| `LOCK TABLE` | **Not covered** | Explicit lock acquisition is not inspected. |
+| Read-only statements such as `SELECT` | **Not covered** | pg_savior does not apply a policy to read-only queries. |
+
+Statements marked **Not covered** pass through to PostgreSQL unchanged; that label is not a safety assessment. Unless a statement is listed as covered above, do not assume pg_savior protects it. Size-sensitive policies use approximate `pg_class.reltuples` statistics, as described under [Configuration](#configuration).
 
 ## Installation
 
