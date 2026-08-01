@@ -3,18 +3,24 @@
 #include <fmgr.h>
 // clang-format on
 #include "access/relation.h"
+#include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
+#include "nodes/value.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "parser/parse_node.h"
+#include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
 
 PG_MODULE_MAGIC;
 
@@ -195,36 +201,130 @@ pg_savior_check_create_index(IndexStmt *stmt)
 }
 
 /*
- * Does this ColumnDef include a DEFAULT clause? The parser represents
- * column-level DEFAULTs as Constraint nodes with contype = CONSTR_DEFAULT
- * in col->constraints (not in raw_default, which is reserved for cooked
- * defaults inherited via CREATE TABLE LIKE etc.).
+ * Return a column DEFAULT expression from either a raw grammar tree or a
+ * transformed ColumnDef. Never modify the returned node: utility trees may be
+ * marked read-only by the caller.
  */
-static bool
-column_has_default(ColumnDef *col)
+static Node *
+column_default_expression(ColumnDef *col)
 {
 	ListCell *lc;
 
 	if (col == NULL)
-		return false;
-
-	if (col->raw_default != NULL || col->cooked_default != NULL)
-		return true;
+		return NULL;
+	if (col->raw_default != NULL)
+		return col->raw_default;
+	if (col->cooked_default != NULL)
+		return col->cooked_default;
 
 	foreach (lc, col->constraints)
 	{
 		Constraint *con = (Constraint *) lfirst(lc);
 
 		if (con->contype == CONSTR_DEFAULT)
+			return con->raw_expr;
+	}
+	return NULL;
+}
+
+/*
+ * Match PostgreSQL's fast-default decision for an explicit column DEFAULT.
+ * cookDefault resolves functions, operators, casts, and the target type;
+ * planner preprocessing then exposes volatility hidden by SQL-function
+ * inlining or default arguments. STABLE expressions are deliberately allowed.
+ */
+static bool
+column_has_constraint_type(ColumnDef *col, ConstrType type)
+{
+	ListCell *lc;
+
+	if (col == NULL)
+		return false;
+	foreach (lc, col->constraints)
+	{
+		Constraint *con = (Constraint *) lfirst(lc);
+
+		if (con->contype == type)
 			return true;
 	}
 	return false;
 }
 
+static bool
+column_uses_serial_pseudotype(ColumnDef *col)
+{
+	char *name;
+
+	if (col == NULL || col->typeName == NULL
+		|| list_length(col->typeName->names) != 1)
+		return false;
+
+	name = strVal(linitial(col->typeName->names));
+	return strcmp(name, "smallserial") == 0
+		|| strcmp(name, "serial2") == 0
+		|| strcmp(name, "serial") == 0
+		|| strcmp(name, "serial4") == 0
+		|| strcmp(name, "bigserial") == 0
+		|| strcmp(name, "serial8") == 0;
+}
+
+static const char *
+column_default_rewrite_op(ColumnDef *col, const char *queryString)
+{
+	Node	   *default_expr;
+	ParseState *pstate;
+	Node	   *cooked;
+	Oid			typeid;
+	int32		typmod;
+	bool		is_volatile;
+
+	if (col == NULL)
+		return NULL;
+	if (col->generated != '\0'
+		|| column_has_constraint_type(col, CONSTR_GENERATED))
+		return "ADD generated COLUMN";
+	if (col->identity != '\0'
+		|| column_has_constraint_type(col, CONSTR_IDENTITY))
+		return "ADD identity COLUMN";
+	if (column_uses_serial_pseudotype(col))
+		return "ADD serial COLUMN";
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+	typenameTypeIdAndMod(pstate, col->typeName, &typeid, &typmod);
+
+	/* Core cannot use attmissingval when domain constraints need checking. */
+	if (DomainHasConstraints(typeid))
+	{
+		free_parsestate(pstate);
+		return "ADD constrained-domain COLUMN";
+	}
+
+	default_expr = column_default_expression(col);
+	if (default_expr == NULL)
+	{
+		free_parsestate(pstate);
+		return NULL;
+	}
+	if (col->cooked_default != NULL)
+		cooked = copyObject(col->cooked_default);
+	else
+		cooked = cookDefault(pstate,
+							copyObject(default_expr),
+							typeid,
+							typmod,
+							col->colname,
+							col->generated);
+
+	is_volatile = contain_volatile_functions_after_planning((Expr *) cooked);
+	free_parsestate(pstate);
+
+	return is_volatile ? "ADD COLUMN with volatile DEFAULT" : NULL;
+}
+
 /*
- * Decide whether this AlterTableCmd is the kind that triggers a rewrite of a
- * large table. Returns the human-readable name of the dangerous operation, or
- * NULL if the cmd is harmless.
+ * Decide whether this AlterTableCmd is the kind that triggers a rewrite or
+ * validation scan of a large table. Returns a human-readable operation name.
  */
 static bool
 column_has_index_constraint(ColumnDef *col)
@@ -247,16 +347,21 @@ column_has_index_constraint(ColumnDef *col)
 }
 
 static const char *
-pg_savior_alter_table_op(AlterTableCmd *cmd)
+pg_savior_alter_table_op(AlterTableCmd *cmd, const char *queryString)
 {
 	switch (cmd->subtype)
 	{
 		case AT_AddColumn:
-			if (column_has_default((ColumnDef *) cmd->def))
-				return "ADD COLUMN with DEFAULT";
+		{
+			const char *default_op = column_default_rewrite_op(
+				(ColumnDef *) cmd->def, queryString);
+
+			if (default_op != NULL)
+				return default_op;
 			if (column_has_index_constraint((ColumnDef *) cmd->def))
 				return "ADD COLUMN with index-backed CONSTRAINT";
 			return NULL;
+		}
 
 		case AT_AlterColumnType:
 			return "ALTER COLUMN TYPE";
@@ -286,29 +391,77 @@ pg_savior_alter_table_op(AlterTableCmd *cmd)
 	}
 }
 
-static void
-pg_savior_check_alter_table(AlterTableStmt *stmt)
+static bool
+string_list_contains(List *items, const char *value)
 {
-	ListCell   *lc;
-	double		reltuples = -2;	/* -2 = not yet looked up; -1 = lookup failed */
+	ListCell *lc;
+
+	foreach (lc, items)
+	{
+		if (strcmp((const char *) lfirst(lc), value) == 0)
+			return true;
+	}
+	return false;
+}
+
+static bool
+alter_statement_drops_column(AlterTableStmt *stmt, const char *name)
+{
+	ListCell *lc;
 
 	foreach (lc, stmt->cmds)
 	{
 		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-		const char *op = pg_savior_alter_table_op(cmd);
 
-		if (op == NULL)
+		if (cmd->subtype == AT_DropColumn
+			&& cmd->name != NULL
+			&& strcmp(cmd->name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+static void
+pg_savior_check_alter_table(AlterTableStmt *stmt, const char *queryString)
+{
+	Relation	rel;
+	Oid			relid;
+	double		reltuples;
+	List	   *added_columns = NIL;
+	ListCell   *lc;
+
+	/* Preserve ALTER TABLE IF EXISTS no-op behavior before cooking defaults. */
+	rel = relation_openrv_extended(stmt->relation, AccessShareLock, true);
+	if (rel == NULL)
+		return;
+
+	relid = RelationGetRelid(rel);
+	reltuples = rel->rd_rel->reltuples;
+	if (reltuples < 0
+		|| reltuples <= pg_savior_large_table_threshold_rows)
+	{
+		relation_close(rel, AccessShareLock);
+		return;
+	}
+
+	foreach (lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+		ColumnDef  *col = cmd->subtype == AT_AddColumn
+			? (ColumnDef *) cmd->def : NULL;
+		const char *op;
+
+		if (col != NULL && cmd->missing_ok
+			&& !alter_statement_drops_column(stmt, col->colname)
+			&& (get_attnum(relid, col->colname) != InvalidAttrNumber
+				|| string_list_contains(added_columns, col->colname)))
 			continue;
 
-		/* Lazy lookup: only inspect the relation once, only if needed */
-		if (reltuples == -2)
-			reltuples = pg_savior_relation_tuples(stmt->relation);
-
-		if (reltuples < 0)	/* relation lookup failed; let standard handler error */
-			return;
-
-		if (reltuples <= pg_savior_large_table_threshold_rows)
-			return;
+		op = pg_savior_alter_table_op(cmd, queryString);
+		if (col != NULL)
+			added_columns = lappend(added_columns, col->colname);
+		if (op == NULL)
+			continue;
 
 		ereport(ERROR,
 				(errcode(ERRCODE_RAISE_EXCEPTION),
@@ -318,6 +471,8 @@ pg_savior_check_alter_table(AlterTableStmt *stmt)
 						 "Plan a safer migration; raise pg_savior.large_table_threshold_rows; "
 						 "or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.")));
 	}
+
+	relation_close(rel, AccessShareLock);
 }
 
 static void
@@ -418,7 +573,8 @@ pg_savior_ProcessUtility(PlannedStmt *pstmt,
 				pg_savior_check_create_index(stmt);
 		}
 		else if (IsA(parsetree, AlterTableStmt))
-			pg_savior_check_alter_table((AlterTableStmt *) parsetree);
+			pg_savior_check_alter_table((AlterTableStmt *) parsetree,
+									 queryString);
 		else if (IsA(parsetree, DropStmt))
 			pg_savior_check_drop((DropStmt *) parsetree);
 		else if (IsA(parsetree, DropdbStmt))
