@@ -1,0 +1,64 @@
+name: PostgreSQL CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg:
+          - "14"
+          - "15"
+          - "16"
+          - "17"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run complete pg_regress suite
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+          TEST_ARTIFACT_DIR: ${{ runner.temp }}/pg-regress-pg${{ matrix.pg }}
+        run: ./docker/test.sh
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-regress-pg${{ matrix.pg }}
+          path: ${{ runner.temp }}/pg-regress-pg${{ matrix.pg }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  ci:
+    name: CI
+    if: ${{ always() }}
+    needs:
+      - regression
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        env:
+          REGRESSION_RESULT: ${{ needs.regression.result }}
+        run: |
+          if [ "$REGRESSION_RESULT" != "success" ]; then
+            echo "PostgreSQL regression matrix result: $REGRESSION_RESULT"
+            exit 1
+          fi
+          echo "All PostgreSQL regression jobs passed."

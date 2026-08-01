@@ -198,6 +198,25 @@ Test against a different Postgres major version:
 PG_MAJOR=15 ./docker/test.sh
 ```
 
+### Continuous integration
+
+Pull requests and pushes to `main` run the complete `pg_regress` suite in the following jobs. Each job maps directly to the same Docker entry point used locally:
+
+| CI job | Local command |
+|---|---|
+| `PostgreSQL 14` | `PG_MAJOR=14 ./docker/test.sh` |
+| `PostgreSQL 15` | `PG_MAJOR=15 ./docker/test.sh` |
+| `PostgreSQL 16` | `PG_MAJOR=16 ./docker/test.sh` |
+| `PostgreSQL 17` | `PG_MAJOR=17 ./docker/test.sh` |
+
+The stable `CI` job is the aggregate branch-protection status; it succeeds only when every version-specific job succeeds and has no additional local test command. Failed version jobs upload the regression diff, actual results, and PostgreSQL container logs when available. To save the same diagnostics locally, set `TEST_ARTIFACT_DIR`, for example:
+
+```bash
+TEST_ARTIFACT_DIR=artifacts PG_MAJOR=17 ./docker/test.sh
+```
+
+`PG_MAJOR` selects the official `postgres:<major>` base image. Pinning the major this way tests each supported server API while still receiving the latest minor and security updates published for that major. To add PostgreSQL 18 or a later supported major, add its quoted major number to `matrix.pg` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml); no new job definition or test script is needed.
+
 If you change a test's SQL, regenerate its expected output:
 
 ```bash
