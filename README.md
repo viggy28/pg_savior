@@ -106,7 +106,7 @@ DELETE 1
 | `pg_savior.enabled` | `on` | session (`USERSET`) | Master switch. When `off`, no checks run. |
 | `pg_savior.bypass` | `off` | session (`USERSET`) | When `on`, all pg_savior guards are bypassed for the current session. Use for an intentional operation that would otherwise be blocked. |
 | `pg_savior.max_rows_affected` | `0` (disabled) | session (`USERSET`) | When > 0, refuse `DELETE`/`UPDATE` whose planner row estimate exceeds this. Catches destructive queries that *do* have a `WHERE` but match too much (e.g. `DELETE FROM emp WHERE id > 0`). |
-| `pg_savior.large_table_threshold_rows` | `1000000` | session (`USERSET`) | Tables with `pg_class.reltuples` greater than this are considered "large" for the DDL guards (currently: `ALTER TABLE ADD COLUMN ... DEFAULT`). Raise it for permissive environments, lower it for stricter ones. |
+| `pg_savior.large_table_threshold_rows` | `1000000` | session (`USERSET`) | Tables with `pg_class.reltuples` greater than this are considered "large" for size-sensitive DDL guards. Raise it for permissive environments, lower it for stricter ones. |
 
 Example bypass for an intentional cleanup:
 
@@ -127,7 +127,7 @@ ERROR:  pg_savior: DELETE estimated to affect 1000 rows, exceeds pg_savior.max_r
 HINT:  Refine the WHERE clause, raise pg_savior.max_rows_affected, or set pg_savior.bypass = on. Run ANALYZE if the estimate looks wrong.
 ```
 
-The threshold uses the planner's row estimate, which depends on table statistics. For accurate enforcement on a recently-modified table, run `ANALYZE` first.
+The threshold uses the planner's row estimate, which remains approximate even with fresh statistics and can be inaccurate when statistics are missing or stale. Run `ANALYZE` after major data changes, choose a conservative threshold, and treat this guard as a seatbelt rather than an exact affected-row guarantee. The estimate guard also walks data-modifying CTEs, so wrapping an `UPDATE` or `DELETE` in `WITH` does not bypass the threshold.
 
 Example DDL guards:
 
@@ -138,7 +138,7 @@ HINT:  Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), or 
 
 postgres=# ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
 ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (5000000 rows) is blocked
-HINT:  Adding a column with a volatile default rewrites the whole table. Add the column without a default first, then backfill in batches; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 
 postgres=# DROP TABLE big_emp;
 ERROR:  pg_savior: DROP TABLE on a large table "big_emp" (5000000 rows) is blocked
@@ -154,10 +154,12 @@ HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_
 
 postgres=# ALTER TABLE big_emp ALTER COLUMN id TYPE bigint;
 ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (5000000 rows) is blocked
-HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 ```
 
 The ADD COLUMN guard is conservative — it blocks any DEFAULT on a large table, even non-volatile ones that PG14+ handles via fast-default and would not actually rewrite. If you frequently add non-volatile defaults, raise `pg_savior.large_table_threshold_rows` or use bypass.
+
+Size-sensitive DDL guards use `pg_class.reltuples`, which is intentionally approximate. A never-analyzed table has unknown statistics, and statistics can be stale after bulk changes. This can produce both false negatives (a large table with missing or stale-low statistics) and false positives (an empty table with stale-high statistics). Run `ANALYZE` before relying on a row threshold; pg_savior does not perform an expensive exact row count while processing DDL.
 
 ## Tests
 
@@ -168,6 +170,15 @@ make installcheck
 ```
 
 Each test file uses `LOAD 'pg_savior'` so the framework works whether or not `pg_savior` is in `shared_preload_libraries`.
+
+The safety-matrix suites pair dangerous and safe forms and verify database state after every rejection:
+
+- `safety_dml_shapes` — CTEs, subqueries, prepared statements, parameters, `RETURNING`, and estimate thresholds
+- `safety_relation_types` — views, partitioned tables, and inherited tables
+- `safety_ddl_edges` — multi-target DDL, index no-ops, generated indexes, constraints, and threshold boundaries
+- `safety_statistics` — deterministic characterization of missing and stale statistics
+
+Literal tautologies such as `WHERE true` count as an explicit `WHERE` clause by design. Enable `pg_savior.max_rows_affected` when protection must be based on estimated impact rather than statement syntax.
 
 ### Docker-based integration test
 
@@ -196,14 +207,16 @@ If you change a test's SQL, regenerate its expected output:
 
 pg_savior installs three hooks:
 
-1. **`post_parse_analyze_hook`** — fires after parse-analyze, before planning. Inspects the `Query` tree: if the statement is `CMD_DELETE`/`CMD_UPDATE` and `query->jointree->quals` is `NULL` (no `WHERE`), it raises `ERROR`. Independent of plan shape; parameterized statements handled correctly; no planner work wasted on a query that will be refused.
+1. **`post_parse_analyze_hook`** — fires after parse-analyze, before planning. Inspects the top-level `Query` and data-modifying CTEs: if a `DELETE`/`UPDATE` has no `WHERE`, it raises `ERROR`. Independent of plan shape; parameterized statements handled correctly; no planner work wasted on a query that will be refused.
 
-2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, reads the planner's row estimate from the source plan beneath the `ModifyTable` node and raises `ERROR` if it exceeds the threshold. The transaction aborts before any tuples are touched.
+2. **`ExecutorStart_hook`** — fires after planning, before execution. If `pg_savior.max_rows_affected > 0`, checks each `ModifyTable` source estimate, including data-modifying CTE subplans, and raises `ERROR` above the threshold. The transaction aborts before any tuples are touched.
 
 3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses:
-   - `CREATE INDEX` without `CONCURRENTLY` (always)
+   - `CREATE INDEX` without `CONCURRENTLY` (except an `IF NOT EXISTS` no-op)
    - `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table is over the threshold
-   - `ALTER TABLE ALTER COLUMN TYPE` when the target table is over the threshold (rewrites the table)
+   - `ALTER TABLE ADD` a newly built index-backed constraint, including column-level `UNIQUE`/`PRIMARY KEY`, when the target table is over the threshold; attaching an existing unique index is allowed, while `PRIMARY KEY ... USING INDEX` remains guarded because it may scan to enforce `NOT NULL`
+   - `ALTER TABLE ADD` a validated `CHECK`/foreign-key constraint when the target table is over the threshold (`NOT VALID` is allowed)
+   - `ALTER TABLE ALTER COLUMN TYPE` when the target table is over the threshold (conservative: some binary-compatible casts do not rewrite)
    - `TRUNCATE` when any target table is over the threshold (multi-table truncates blocked if *any* target is large)
    - `DROP TABLE` when any target table is over the threshold (multi-table drops blocked if *any* target is large)
    - `DROP DATABASE` (always)

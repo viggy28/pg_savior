@@ -1,0 +1,177 @@
+LOAD 'pg_savior';
+CREATE EXTENSION IF NOT EXISTS pg_savior;
+NOTICE:  extension "pg_savior" already exists, skipping
+SET pg_savior.large_table_threshold_rows = 10;
+-- IF NOT EXISTS is allowed only when the named relation already makes it a no-op.
+CREATE TABLE index_target (id int);
+CREATE INDEX CONCURRENTLY index_target_id_idx ON index_target (id);
+CREATE INDEX IF NOT EXISTS index_target_id_idx ON index_target (id);
+NOTICE:  relation "index_target_id_idx" already exists, skipping
+CREATE INDEX IF NOT EXISTS index_target_missing_idx ON index_target (id);
+ERROR:  pg_savior: CREATE INDEX without CONCURRENTLY is blocked
+HINT:  Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), or set pg_savior.bypass = on for this session.
+SELECT to_regclass('index_target_missing_idx') IS NULL AS missing_index_was_blocked;
+ missing_index_was_blocked 
+---------------------------
+ t
+(1 row)
+
+DROP INDEX index_target_id_idx;
+DROP TABLE index_target;
+-- Index-backed constraints on an existing large table build an index while locked.
+CREATE TABLE big_constraint (id int);
+INSERT INTO big_constraint SELECT generate_series(1, 100);
+ANALYZE big_constraint;
+ALTER TABLE big_constraint ADD CONSTRAINT big_constraint_unsafe UNIQUE (id);
+ERROR:  pg_savior: ALTER TABLE ADD index-backed CONSTRAINT on a large table (100 rows) is blocked
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS unsafe_constraint_count
+FROM pg_constraint WHERE conname = 'big_constraint_unsafe';
+ unsafe_constraint_count 
+-------------------------
+                       0
+(1 row)
+
+-- Column-level UNIQUE/PRIMARY KEY constraints also build indexes.
+ALTER TABLE big_constraint ADD COLUMN unsafe_column int UNIQUE;
+ERROR:  pg_savior: ALTER TABLE ADD COLUMN with index-backed CONSTRAINT on a large table (100 rows) is blocked
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS unsafe_column_count
+FROM information_schema.columns
+WHERE table_name = 'big_constraint' AND column_name = 'unsafe_column';
+ unsafe_column_count 
+---------------------
+                   0
+(1 row)
+
+ALTER TABLE big_constraint ADD COLUMN unsafe_primary int PRIMARY KEY;
+ERROR:  pg_savior: ALTER TABLE ADD COLUMN with index-backed CONSTRAINT on a large table (100 rows) is blocked
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS unsafe_primary_count
+FROM information_schema.columns
+WHERE table_name = 'big_constraint' AND column_name = 'unsafe_primary';
+ unsafe_primary_count 
+----------------------
+                    0
+(1 row)
+
+-- Validated CHECK/FK constraints scan existing rows; NOT VALID is the safe form.
+ALTER TABLE big_constraint ADD CONSTRAINT big_constraint_validated CHECK (id > 0);
+ERROR:  pg_savior: ALTER TABLE ADD validated CONSTRAINT on a large table (100 rows) is blocked
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS validated_constraint_count
+FROM pg_constraint WHERE conname = 'big_constraint_validated';
+ validated_constraint_count 
+----------------------------
+                          0
+(1 row)
+
+ALTER TABLE big_constraint
+  ADD CONSTRAINT big_constraint_not_valid CHECK (id > 0) NOT VALID;
+SELECT count(*) AS not_valid_constraint_count
+FROM pg_constraint WHERE conname = 'big_constraint_not_valid';
+ not_valid_constraint_count 
+----------------------------
+                          1
+(1 row)
+
+-- Safe migration path: build concurrently, then attach the existing index.
+CREATE UNIQUE INDEX CONCURRENTLY big_constraint_id_idx ON big_constraint (id);
+ALTER TABLE big_constraint
+  ADD CONSTRAINT big_constraint_safe UNIQUE USING INDEX big_constraint_id_idx;
+NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "big_constraint_id_idx" to "big_constraint_safe"
+SELECT count(*) AS safe_constraint_count
+FROM pg_constraint WHERE conname = 'big_constraint_safe';
+ safe_constraint_count 
+-----------------------
+                     1
+(1 row)
+
+-- PRIMARY KEY USING INDEX may scan to enforce NOT NULL, so it stays guarded.
+ALTER TABLE big_constraint ADD COLUMN nullable_id int;
+UPDATE big_constraint SET nullable_id = id WHERE id > 1;
+CREATE UNIQUE INDEX CONCURRENTLY big_constraint_nullable_idx
+  ON big_constraint (nullable_id);
+ALTER TABLE big_constraint
+  ADD CONSTRAINT big_constraint_pk PRIMARY KEY
+  USING INDEX big_constraint_nullable_idx;
+ERROR:  pg_savior: ALTER TABLE ADD PRIMARY KEY USING INDEX on a large table (100 rows) is blocked
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS using_index_pk_count
+FROM pg_constraint WHERE conname = 'big_constraint_pk';
+ using_index_pk_count 
+----------------------
+                    0
+(1 row)
+
+-- The same generated constraint index is allowed on a small existing table.
+CREATE TABLE small_constraint (id int);
+INSERT INTO small_constraint VALUES (1), (2);
+ANALYZE small_constraint;
+ALTER TABLE small_constraint ADD CONSTRAINT small_constraint_u UNIQUE (id);
+ALTER TABLE small_constraint ADD COLUMN other_id int UNIQUE;
+-- Generated indexes on new ordinary and partitioned tables remain allowed.
+CREATE TABLE generated_keys (id int PRIMARY KEY, email text UNIQUE);
+CREATE TABLE generated_partitioned (id int PRIMARY KEY) PARTITION BY RANGE (id);
+CREATE TABLE generated_partitioned_1 PARTITION OF generated_partitioned
+  FOR VALUES FROM (0) TO (100);
+-- Threshold equality is allowed; one row above is blocked.
+CREATE TABLE exactly_threshold (id int);
+INSERT INTO exactly_threshold SELECT generate_series(1, 10);
+ANALYZE exactly_threshold;
+TRUNCATE exactly_threshold;
+SELECT count(*) AS exact_rows_after_truncate FROM exactly_threshold;
+ exact_rows_after_truncate 
+---------------------------
+                         0
+(1 row)
+
+CREATE TABLE above_threshold (id int);
+INSERT INTO above_threshold SELECT generate_series(1, 11);
+ANALYZE above_threshold;
+TRUNCATE above_threshold;
+ERROR:  pg_savior: TRUNCATE on a large table "above_threshold" (11 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS above_rows_after_truncate FROM above_threshold;
+ above_rows_after_truncate 
+---------------------------
+                        11
+(1 row)
+
+-- Multi-target order and missing IF EXISTS targets cannot hide a large table.
+CREATE TABLE tiny_target (id int);
+INSERT INTO tiny_target VALUES (1);
+ANALYZE tiny_target;
+TRUNCATE above_threshold, tiny_target;
+ERROR:  pg_savior: TRUNCATE on a large table "above_threshold" (11 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT count(*) AS above_after_multi_truncate FROM above_threshold;
+ above_after_multi_truncate 
+----------------------------
+                         11
+(1 row)
+
+SELECT count(*) AS tiny_after_multi_truncate FROM tiny_target;
+ tiny_after_multi_truncate 
+---------------------------
+                         1
+(1 row)
+
+DROP TABLE IF EXISTS absent_target, above_threshold;
+ERROR:  pg_savior: DROP TABLE on a large table "above_threshold" (11 rows) is blocked
+HINT:  Verify the target, raise pg_savior.large_table_threshold_rows, or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+SELECT to_regclass('above_threshold') IS NOT NULL AS above_survived_multi_drop;
+ above_survived_multi_drop 
+---------------------------
+ t
+(1 row)
+
+SET pg_savior.bypass = on;
+DROP TABLE above_threshold;
+DROP TABLE big_constraint;
+RESET pg_savior.bypass;
+DROP TABLE tiny_target;
+DROP TABLE exactly_threshold;
+DROP TABLE small_constraint;
+DROP TABLE generated_partitioned;
+DROP TABLE generated_keys;

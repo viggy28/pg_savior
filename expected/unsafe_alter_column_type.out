@@ -14,11 +14,11 @@ INSERT INTO big_emp SELECT generate_series(1, 100), 'x';
 ANALYZE big_emp;
 ALTER TABLE big_emp ALTER COLUMN id TYPE bigint;
 ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (100 rows) is blocked
-HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 -- Multi-cmd: blocked if any cmd is a type change
 ALTER TABLE big_emp ADD COLUMN extra int, ALTER COLUMN name TYPE varchar(50);
 ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (100 rows) is blocked
-HINT:  This operation rewrites the whole table. Plan a batched migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
+HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 -- Multi-cmd without type change or default: allowed
 ALTER TABLE big_emp ADD COLUMN y1 int, ADD COLUMN y2 int;
 -- Bypass overrides
