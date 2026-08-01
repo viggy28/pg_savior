@@ -10,7 +10,7 @@ pg_savior is a PostgreSQL extension that prevents accidental data loss from `DEL
 
 ## Status
 
-Under active development. Pre-1.0. Not production-ready.
+Pre-1.0: APIs, configuration, and policy defaults may change between releases. The regression suite validates both blocked and allowed statement shapes across PostgreSQL 14–17; review the documented statistics limitations and test your workload-specific policies before rollout.
 
 ## Features
 
@@ -18,15 +18,15 @@ Under active development. Pre-1.0. Not production-ready.
 - [x] Block `UPDATE` without `WHERE`
 - [x] Row-count threshold guard (`pg_savior.max_rows_affected`)
 - [x] Block `CREATE INDEX` without `CONCURRENTLY`
-- [x] Block `ALTER TABLE ADD COLUMN ... DEFAULT` on large tables
+- [x] Block rewrite-causing `ALTER TABLE ADD COLUMN` operations on large tables
 - [x] Block `ALTER TABLE ALTER COLUMN TYPE` on large tables
 - [x] Block `TRUNCATE` on large tables
 - [x] Block `DROP TABLE` on large tables
 - [x] Block `DROP DATABASE`
 - [x] Per-session bypass GUC (`pg_savior.bypass`)
-- [x] Global on/off GUC (`pg_savior.enabled`)
+- [x] Session-level on/off GUC (`pg_savior.enabled`)
 - [ ] Per-table opt-out via reloptions
-- [ ] Volatility detection for `ADD COLUMN` (only block volatile defaults)
+- [x] Volatility-aware `ADD COLUMN DEFAULT` detection
 
 ## Installation
 
@@ -136,8 +136,8 @@ postgres=# CREATE INDEX emp_idx ON emp (id);
 ERROR:  pg_savior: CREATE INDEX without CONCURRENTLY is blocked
 HINT:  Use CREATE INDEX CONCURRENTLY (it cannot run in a transaction block), or set pg_savior.bypass = on for this session.
 
-postgres=# ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
-ERROR:  pg_savior: ALTER TABLE ADD COLUMN with DEFAULT on a large table (5000000 rows) is blocked
+postgres=# ALTER TABLE big_emp ADD COLUMN sample double precision DEFAULT random();
+ERROR:  pg_savior: ALTER TABLE ADD COLUMN with volatile DEFAULT on a large table (5000000 rows) is blocked
 HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 
 postgres=# DROP TABLE big_emp;
@@ -157,7 +157,11 @@ ERROR:  pg_savior: ALTER TABLE ALTER COLUMN TYPE on a large table (5000000 rows)
 HINT:  This operation can rewrite or scan the whole table while holding a strong lock. Plan a safer migration; raise pg_savior.large_table_threshold_rows; or set pg_savior.bypass = on. Run ANALYZE if the row estimate looks wrong.
 ```
 
-The ADD COLUMN guard is conservative — it blocks any DEFAULT on a large table, even non-volatile ones that PG14+ handles via fast-default and would not actually rewrite. If you frequently add non-volatile defaults, raise `pg_savior.large_table_threshold_rows` or use bypass.
+The ADD COLUMN guard follows PostgreSQL's fast-default rules. Immutable constants and expressions, plus `STABLE` functions such as `now()`, are evaluated once and stored as a missing value without rewriting existing rows, so pg_savior allows them. `VOLATILE` expressions such as `random()`, `nextval()`, and volatile user-defined functions require per-row evaluation and are blocked on large tables. Defaults and implicit values that require rewrites—constrained domains, serial/identity columns, and stored generated columns—are blocked as well.
+
+Volatility comes from PostgreSQL's function catalog metadata. User-defined functions must be labeled correctly (`IMMUTABLE`, `STABLE`, or `VOLATILE`) for PostgreSQL and pg_savior to classify them correctly.
+
+The volatility check covers explicit column defaults. An implicit default supplied only by an unconstrained domain is left to PostgreSQL because its backfill behavior differs across supported server minors; use an explicit column default when you want pg_savior to classify that expression.
 
 Size-sensitive DDL guards use `pg_class.reltuples`, which is intentionally approximate. A never-analyzed table has unknown statistics, and statistics can be stale after bulk changes. This can produce both false negatives (a large table with missing or stale-low statistics) and false positives (an empty table with stale-high statistics). Run `ANALYZE` before relying on a row threshold; pg_savior does not perform an expensive exact row count while processing DDL.
 
@@ -213,7 +217,7 @@ pg_savior installs three hooks:
 
 3. **`ProcessUtility_hook`** — fires for utility statements (DDL). Refuses:
    - `CREATE INDEX` without `CONCURRENTLY` (except an `IF NOT EXISTS` no-op)
-   - `ALTER TABLE ADD COLUMN ... DEFAULT` when the target table is over the threshold
+   - `ALTER TABLE ADD COLUMN` when the default is volatile or the new column otherwise requires a per-row rewrite (constrained domain, serial/identity, or stored generated column) and the target table is over the threshold
    - `ALTER TABLE ADD` a newly built index-backed constraint, including column-level `UNIQUE`/`PRIMARY KEY`, when the target table is over the threshold; attaching an existing unique index is allowed, while `PRIMARY KEY ... USING INDEX` remains guarded because it may scan to enforce `NOT NULL`
    - `ALTER TABLE ADD` a validated `CHECK`/foreign-key constraint when the target table is over the threshold (`NOT VALID` is allowed)
    - `ALTER TABLE ALTER COLUMN TYPE` when the target table is over the threshold (conservative: some binary-compatible casts do not rewrite)

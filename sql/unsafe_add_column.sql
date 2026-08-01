@@ -1,38 +1,154 @@
 LOAD 'pg_savior';
 CREATE EXTENSION IF NOT EXISTS pg_savior;
 
--- Lower the threshold so a tiny test table counts as "large"
 SET pg_savior.large_table_threshold_rows = 10;
 
--- Small table (under threshold): ADD COLUMN with default is allowed
+CREATE FUNCTION immutable_default() RETURNS integer
+LANGUAGE sql IMMUTABLE AS $$ SELECT 7 $$;
+CREATE FUNCTION volatile_default() RETURNS double precision
+LANGUAGE sql VOLATILE AS $$ SELECT random() $$;
+CREATE FUNCTION stable_with_volatile_argument(
+  input_value double precision DEFAULT random()
+) RETURNS double precision
+LANGUAGE sql STABLE AS $$ SELECT input_value $$;
+CREATE SEQUENCE default_seq;
+CREATE DOMAIN positive_int AS integer CHECK (VALUE > 0);
+
+-- A volatile default on a small table remains allowed by the size threshold.
 CREATE TABLE small_emp (id int);
 INSERT INTO small_emp SELECT generate_series(1, 5);
 ANALYZE small_emp;
-ALTER TABLE small_emp ADD COLUMN status text DEFAULT 'active';
-SELECT status FROM small_emp LIMIT 1;
+ALTER TABLE small_emp ADD COLUMN sample double precision DEFAULT random();
+SELECT count(*) AS small_rows_with_default
+FROM small_emp WHERE sample IS NOT NULL;
 DROP TABLE small_emp;
 
--- Large table (over threshold): ADD COLUMN with default is blocked
+-- Missing relations remain PostgreSQL no-ops; defaults are not pre-evaluated.
+ALTER TABLE IF EXISTS missing_emp ADD COLUMN broken int DEFAULT (1 / 0);
+
 CREATE TABLE big_emp (id int);
 INSERT INTO big_emp SELECT generate_series(1, 100);
 ANALYZE big_emp;
+
+-- Immutable literals and expressions use PostgreSQL's fast-default path.
 ALTER TABLE big_emp ADD COLUMN status text DEFAULT 'active';
+SELECT count(*) AS status_rows FROM big_emp WHERE status = 'active';
+SELECT atthasmissing AS status_uses_missing_value
+FROM pg_attribute
+WHERE attrelid = 'big_emp'::regclass AND attname = 'status';
 
--- ADD COLUMN without default: always allowed (no rewrite risk)
-ALTER TABLE big_emp ADD COLUMN status text;
+-- Existing-column IF NOT EXISTS is also a no-op, even with a volatile default.
+ALTER TABLE big_emp ADD COLUMN IF NOT EXISTS status double precision
+  DEFAULT random();
+SELECT data_type AS status_type_after_noop
+FROM information_schema.columns
+WHERE table_name = 'big_emp' AND column_name = 'status';
 
--- Same large table: bypass overrides
+ALTER TABLE big_emp ADD COLUMN normalized text DEFAULT lower('READY');
+SELECT count(*) AS normalized_rows FROM big_emp WHERE normalized = 'ready';
+
+-- STABLE defaults are evaluated once and also avoid a rewrite.
+ALTER TABLE big_emp ADD COLUMN created_at timestamptz DEFAULT now();
+SELECT count(*) AS created_rows,
+       count(DISTINCT created_at) AS distinct_created_values
+FROM big_emp WHERE created_at IS NOT NULL;
+
+-- Function volatility is resolved from pg_proc, not guessed from SQL text.
+ALTER TABLE big_emp ADD COLUMN immutable_value int DEFAULT immutable_default();
+SELECT count(*) AS immutable_rows
+FROM big_emp WHERE immutable_value = 7;
+
+-- VOLATILE defaults require per-row evaluation and are blocked on large tables.
+ALTER TABLE big_emp ADD COLUMN random_value double precision DEFAULT random();
+SELECT count(*) AS random_column_count
+FROM information_schema.columns
+WHERE table_name = 'big_emp' AND column_name = 'random_value';
+
+-- Volatility nested inside a larger expression is still detected.
+ALTER TABLE big_emp ADD COLUMN nested_random double precision
+  DEFAULT coalesce(random(), 0);
+SELECT count(*) AS nested_random_column_count
+FROM information_schema.columns
+WHERE table_name = 'big_emp' AND column_name = 'nested_random';
+
+-- Sequence defaults and user-defined VOLATILE functions are blocked too.
+ALTER TABLE big_emp ADD COLUMN sequence_value bigint
+  DEFAULT nextval('default_seq');
+ALTER TABLE big_emp ADD COLUMN function_value double precision
+  DEFAULT volatile_default();
+-- Planner preprocessing exposes volatility in omitted function arguments.
+ALTER TABLE big_emp ADD COLUMN argument_value double precision
+  DEFAULT stable_with_volatile_argument();
+SELECT count(*) AS volatile_function_columns
+FROM information_schema.columns
+WHERE table_name = 'big_emp'
+  AND column_name IN ('sequence_value', 'function_value', 'argument_value');
+
+-- Constrained domains cannot use the missing-value optimization safely,
+-- including when no explicit column default is written.
+ALTER TABLE big_emp ADD COLUMN domain_value positive_int DEFAULT 1;
+ALTER TABLE big_emp ADD COLUMN implicit_domain_value positive_int;
+SELECT count(*) AS domain_column_count
+FROM information_schema.columns
+WHERE table_name = 'big_emp'
+  AND column_name IN ('domain_value', 'implicit_domain_value');
+
+SELECT count(*) AS fast_defaults_using_missing_values
+FROM pg_attribute
+WHERE attrelid = 'big_emp'::regclass
+  AND attname IN ('status', 'normalized', 'created_at', 'immutable_value')
+  AND atthasmissing;
+
+-- Serial, identity, and stored generated columns synthesize rewrite work.
+ALTER TABLE big_emp ADD COLUMN serial_value serial;
+ALTER TABLE big_emp ADD COLUMN identity_value bigint
+  GENERATED BY DEFAULT AS IDENTITY;
+ALTER TABLE big_emp ADD COLUMN generated_value int
+  GENERATED ALWAYS AS (id * 2) STORED;
+SELECT count(*) AS synthesized_rewrite_columns
+FROM information_schema.columns
+WHERE table_name = 'big_emp'
+  AND column_name IN ('serial_value', 'identity_value', 'generated_value');
+
+-- ADD COLUMN without a default is always allowed for ordinary base types.
+ALTER TABLE big_emp ADD COLUMN notes text;
+
+-- One volatile subcommand blocks the whole multi-command ALTER atomically.
+ALTER TABLE big_emp
+  ADD COLUMN safe_multi int DEFAULT 1,
+  ADD COLUMN unsafe_multi double precision DEFAULT random();
+SELECT count(*) AS multi_columns_after_block
+FROM information_schema.columns
+WHERE table_name = 'big_emp'
+  AND column_name IN ('safe_multi', 'unsafe_multi');
+
+-- Multiple non-volatile defaults are allowed.
+ALTER TABLE big_emp
+  ADD COLUMN safe_one int DEFAULT 1,
+  ADD COLUMN safe_two timestamptz DEFAULT statement_timestamp();
+SELECT count(*) AS safe_multi_columns
+FROM information_schema.columns
+WHERE table_name = 'big_emp'
+  AND column_name IN ('safe_one', 'safe_two');
+
+-- Explicit bypass and disable still override volatility protection.
 SET pg_savior.bypass = on;
-ALTER TABLE big_emp ADD COLUMN flag text DEFAULT 'set';
+ALTER TABLE big_emp ADD COLUMN bypass_random double precision DEFAULT random();
 RESET pg_savior.bypass;
+SELECT count(*) AS bypass_rows
+FROM big_emp WHERE bypass_random IS NOT NULL;
 
--- Multiple commands in one ALTER: blocked if any AddColumn has a default
-ALTER TABLE big_emp ADD COLUMN x1 int, ADD COLUMN x2 int DEFAULT 0;
+SET pg_savior.enabled = off;
+ALTER TABLE big_emp ADD COLUMN disabled_random double precision DEFAULT random();
+SET pg_savior.enabled = on;
+SELECT count(*) AS disabled_rows
+FROM big_emp WHERE disabled_random IS NOT NULL;
 
--- Multiple commands without any default: allowed
-ALTER TABLE big_emp ADD COLUMN y1 int, ADD COLUMN y2 int;
-
--- Cleanup: bypass the new DROP TABLE guard since we lowered the threshold
 SET pg_savior.bypass = on;
 DROP TABLE big_emp;
 RESET pg_savior.bypass;
+DROP DOMAIN positive_int;
+DROP SEQUENCE default_seq;
+DROP FUNCTION stable_with_volatile_argument(double precision);
+DROP FUNCTION volatile_default();
+DROP FUNCTION immutable_default();
