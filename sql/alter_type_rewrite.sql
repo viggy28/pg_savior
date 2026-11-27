@@ -84,8 +84,10 @@ INSERT INTO alter_invalid SELECT '1' FROM generate_series(1, 100);
 ANALYZE alter_invalid;
 ALTER TABLE alter_invalid ALTER value TYPE integer;
 CREATE VIEW alter_invalid_view AS SELECT value FROM alter_invalid;
+\set VERBOSITY terse
 ALTER TABLE alter_invalid ALTER value TYPE varchar;
 ALTER TABLE alter_invalid ALTER value TYPE bigint USING value::bigint;
+\set VERBOSITY default
 
 CREATE TABLE alter_bad_default (value integer DEFAULT 1);
 INSERT INTO alter_bad_default SELECT g FROM generate_series(1, 100) AS g;
@@ -99,7 +101,10 @@ CREATE TABLE alter_generated (
 );
 INSERT INTO alter_generated SELECT g::text FROM generate_series(1, 100) AS g;
 ANALYZE alter_generated;
+\set VERBOSITY sqlstate
 ALTER TABLE alter_generated ALTER generated_value TYPE integer USING generated_value::integer;
+\echo :LAST_ERROR_MESSAGE
+\set VERBOSITY default
 
 CREATE TABLE alter_identity (id integer GENERATED ALWAYS AS IDENTITY, filler text);
 INSERT INTO alter_identity (filler) SELECT 'x' FROM generate_series(1, 100);
@@ -135,7 +140,9 @@ ANALYZE alter_dep_parent;
 ANALYZE alter_dep_large;
 ANALYZE alter_dep_later;
 CREATE VIEW alter_dep_view AS SELECT id FROM alter_dep_later;
+\set VERBOSITY terse
 ALTER TABLE alter_dep_parent ALTER id TYPE bigint;
+\set VERBOSITY default
 
 -- A foreign inheritance parent cannot hide a large physical child.
 CREATE FOREIGN DATA WRAPPER alter_dummy_fdw;
