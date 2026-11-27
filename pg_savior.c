@@ -1,8 +1,10 @@
 // clang-format off
 #include <postgres.h>
 #include <fmgr.h>
+#include <limits.h>
 // clang-format on
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/heap.h"
@@ -50,6 +52,16 @@ PG_MODULE_MAGIC;
 void _PG_init(void);
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+
+static bool
+savior_domain_has_constraints(Oid domain)
+{
+#if PG_VERSION_NUM >= 190000
+	return DomainHasConstraints(domain, NULL);
+#else
+	return DomainHasConstraints(domain);
+#endif
+}
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
@@ -83,7 +95,12 @@ pg_savior_check_query(Query *query)
 }
 
 static void
-pg_savior_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+pg_savior_post_parse_analyze(ParseState *pstate, Query *query,
+#if PG_VERSION_NUM >= 190000
+                             const JumbleState *jstate)
+#else
+                             JumbleState *jstate)
+#endif
 {
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query, jstate);
@@ -358,7 +375,7 @@ column_default_rewrite_op(ColumnDef *col, const char *queryString)
 	typenameTypeIdAndMod(pstate, col->typeName, &typeid, &typmod);
 
 	/* Core cannot use attmissingval when domain constraints need checking. */
-	if (DomainHasConstraints(typeid))
+	if (savior_domain_has_constraints(typeid))
 	{
 		free_parsestate(pstate);
 		return "ADD constrained-domain COLUMN";
@@ -430,7 +447,7 @@ pg_savior_column_change_requires_rewrite(Node *expr, AttrNumber varattno)
 		{
 			CoerceToDomain *domain = (CoerceToDomain *) expr;
 
-			if (DomainHasConstraints(domain->resulttype))
+			if (savior_domain_has_constraints(domain->resulttype))
 				return true;
 			expr = (Node *) domain->arg;
 		}
